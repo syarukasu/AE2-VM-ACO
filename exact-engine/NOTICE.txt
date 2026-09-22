@@ -1,0 +1,17 @@
+ACO Exact VM is an LGPL-3.0 derivative module in the AE2-VM fork.
+Original project: TaoLe-si/AE2-VM
+https://github.com/TaoLe-si/AE2-VM
+Base: 1.20.1-forge f9e083732ee654a99a1679bcdee7f864eb90be94
+Fork: https://github.com/syarukasu/AE2-VM-ACO
+Changes (2026-09-22): detached indexed bytecode compiler and BigInteger
+inventory/demand/result interpreter, based on the upstream Opcode,
+CraftingBytecode builder and CraftingVM stack/extraction model.
+Integer pool operands replace live AEKey/IPatternDetails references.
+Cumulative amounts never use KeyCounter or ICraftingPlan long fields.
+The original authors retain their credits; see LICENSE-AE2-VM.
+This library does not include upstream mod interception or bootstrap.
+Changes (2026-09-23): ordered REQUEST/RETURN_CONTAINERS/INSERT/RECORD bytecode,
+BigInteger branch transactions and read-interval repeat proofs adapted from
+ACO's rc.4 OrderedBranchingPlanner (Issue #190). The fork's native-engine
+owns live capture through AE2 and calculation entry. ACO supplies exact stock
+and bridges completed quantities; AE2 and add-ons retain physical ownership.

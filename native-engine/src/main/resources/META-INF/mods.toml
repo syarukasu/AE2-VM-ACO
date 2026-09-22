@@ -1,0 +1,15 @@
+modLoader="javafml"
+loaderVersion="[47,)"
+license="LGPL-3.0"
+[[mods]]
+modId="ae2vm_aco"
+version="0.2.0"
+displayName="AE2 VM ACO Exact Fork"
+authors="AE2-VM contributors, syarukasu"
+description='''Native VM-owned crafting calculation with exact BigInteger accounting.'''
+[[dependencies.ae2vm_aco]]
+modId="ae2"
+mandatory=true
+versionRange="[15.4.10,16)"
+ordering="AFTER"
+side="BOTH"

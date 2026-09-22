@@ -1,0 +1,30 @@
+plugins {
+    id 'java-library'
+    id 'maven-publish'
+}
+group = 'com.syaru.ae2vm'
+version = '0.1.2'
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(17)
+    withSourcesJar()
+}
+repositories { mavenCentral() }
+dependencies { testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2' }
+tasks.withType(Test).configureEach { useJUnitPlatform() }
+tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
+tasks.withType(Jar).configureEach {
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    from('../LICENSE') { into 'META-INF'; rename { 'LICENSE-AE2-VM' } }
+    from('NOTICE.txt') { into 'META-INF' }
+}
+jar {
+    manifest.attributes(
+        'Automatic-Module-Name': 'com.syaru.ae2vm.exact',
+        'FMLModType': 'GAMELIBRARY',
+        'Implementation-Version': project.version)
+}
+publishing {
+    publications { engine(MavenPublication) { from components.java } }
+    repositories { maven { name = 'localProbe'; url = layout.buildDirectory.dir('repo') } }
+}
