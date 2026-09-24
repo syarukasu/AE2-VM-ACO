@@ -10,7 +10,6 @@ import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 import com.mojang.logging.LogUtils;
-import com.syaru.ae2vm.exact.ExactBranchVM;
 import java.math.BigInteger;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -32,6 +31,8 @@ import org.slf4j.Logger;
 /** Native VM request owner. No dependency on ACO's graph/planner/capture classes. */
 public final class NativeVm {
     private static final Logger LOG = LogUtils.getLogger();
+    private static final NativeVmDiagnostics DIAGNOSTICS = new NativeVmDiagnostics(LOG, System::nanoTime,
+            Boolean.getBoolean("ae2vm.diagnostics.verbose"));
     private static final Map<IGrid, Long> EPOCHS = Collections.synchronizedMap(new WeakHashMap<>());
     private static final AtomicLong RECIPES = new AtomicLong();
     private static final AtomicLong ORDERS = new AtomicLong();
@@ -78,24 +79,16 @@ public final class NativeVm {
     private static ICraftingPlan compute(long order, IGrid grid, Level level, AEKey output,
             BigInteger request, CalculationStrategy strategy) {
         long started = System.nanoTime();
-        LOG.info("AE2-VM event=started order={} output={} requested={} owner=vm-native", order, output.getId(), request);
+        DIAGNOSTICS.started();
+        if (DIAGNOSTICS.verbose())
+            LOG.debug("AE2-VM event=started order={} output={} requested={} owner=vm-native", order, output.getId(), request);
         try {
             for (int attempt = 0; ; attempt++) {
                 try {
                     VmAccounting extension = accounting;
-                    var capture = new NativeVmCapture(grid, level, extension);
-                    BigInteger maximum = extension == null ? BigInteger.TEN.pow(16_384).subtract(BigInteger.ONE)
-                            : extension.maximumCount();
-                    long[] nextLog = {started + TimeUnit.SECONDS.toNanos(5)};
-                    var result = new ExactBranchVM<>(output, capture::candidates, capture::emittable,
-                            capture::amount, key -> key.getType().getAmountPerByte(), work -> {
-                                if (Thread.currentThread().isInterrupted()) throw new CancellationException("VM order cancelled");
-                                if ((work & 1023) == 0 && System.nanoTime() >= nextLog[0]) {
-                                    LOG.info("AE2-VM event=running order={} work={} elapsedMs={}", order, work,
-                                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-                                    nextLog[0] = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-                                }
-                            }, maximum, capture).plan(request, strategy == CalculationStrategy.CRAFT_LESS);
+                    var capture = new NativeVmCapture(grid, level, extension, work -> DIAGNOSTICS.running(
+                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)));
+                    var result = capture.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS);
                     var bindings = capture.bindings();
                     BigInteger bytes = bytes(result);
                     boolean wide = result.requested().bitLength() > 63
@@ -104,7 +97,7 @@ public final class NativeVm {
                     wide |= capture.widePendingOutputs(result.crafts());
                     var exact = new NativeVmResult(result, bindings, bytes, wide);
                     capture.validate();
-                    LOG.info("AE2-VM event=quantities_ready order={} patterns={} usedKeys={} missingKeys={} wide={} elapsedMs={}",
+                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantities_ready order={} patterns={} usedKeys={} missingKeys={} wide={} elapsedMs={}",
                             order, result.crafts().size(), result.used().size(), result.missing().size(), exact.wide(),
                             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     ICraftingPlan plan = capture.callServer(() -> {
@@ -114,21 +107,29 @@ public final class NativeVm {
                         }
                         return ordinaryPlan(exact);
                     });
-                    LOG.info("AE2-VM event=quantity_calculated route=vm-native order={} output={} requested={} "
+                    DIAGNOSTICS.completed(order, output.getId(), request,
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation());
+                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} output={} requested={} "
                                     + "instructions={} work={} skipped={} simulation={} elapsedMs={}",
                             order, output.getId(), result.requested(), result.instructions(), result.work(),
                             result.skippedIterations(), plan.simulation(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     return plan;
                 } catch (Changed changed) {
-                    if (attempt >= 2) throw changed;
-                    LOG.info("AE2-VM event=recapture order={} reason={}", order, changed.getMessage());
+                    DIAGNOSTICS.recaptured();
+                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=recapture order={} reason={}", order, changed.getMessage());
+                    try { TimeUnit.MILLISECONDS.sleep(50L << Math.min(attempt, 4)); }
+                    catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new CancellationException("VM recapture cancelled");
+                    }
                 }
             }
         } catch (CancellationException cancelled) {
-            LOG.info("AE2-VM event=cancelled order={}", order);
+            DIAGNOSTICS.cancelled();
+            if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=cancelled order={}", order);
             throw cancelled;
         } catch (RuntimeException failure) {
-            LOG.error("AE2-VM event=failed order={} output={} requested={}", order, output.getId(), request, failure);
+            DIAGNOSTICS.failed(order, output.getId(), request, failure);
             throw failure;
         }
     }
@@ -140,7 +141,7 @@ public final class NativeVm {
         Map<IPatternDetails, Long> times = new LinkedHashMap<>();
         result.crafts().forEach((id, count) -> times.put(exact.bindings().get(id), count.longValueExact()));
         return new CraftingPlan(new GenericStack(result.root(), result.requested().longValueExact()),
-                (long) Math.ceil(result.legacyBytes()), !result.missing().isEmpty(), result.multiplePaths(),
+                exact.bytes().longValueExact(), !result.missing().isEmpty(), result.multiplePaths(),
                 counter(result.used()), counter(result.emitted()), counter(result.missing()), Map.copyOf(times));
     }
 
@@ -150,7 +151,7 @@ public final class NativeVm {
         return result;
     }
 
-    private static BigInteger bytes(ExactBranchVM.Result<AEKey> result) {
+    private static BigInteger bytes(VmQuantities result) {
         BigInteger whole = result.integerCharges(), numerator = BigInteger.ZERO, denominator = BigInteger.ONE;
         for (var entry : result.stackCharges().entrySet()) {
             BigInteger divisor = BigInteger.valueOf(entry.getKey().getType().getAmountPerByte());

@@ -4,7 +4,7 @@ import appeng.api.crafting.IPatternDetails;
 import appeng.api.crafting.IPatternDetails.IInput;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
-import com.ae2vm.addon.AE2VMAddon;
+import java.math.BigInteger;
 import com.ae2vm.addon.vm.CraftingBytecode;
 import com.ae2vm.addon.vm.Opcode;
 import java.util.Map;
@@ -13,6 +13,25 @@ import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.resources.ResourceLocation;
 
 public class PatternCompiler {
+   public interface DetachedPattern extends IPatternDetails { }
+   /** Values observed at the live API boundary; no worker-thread world query is permitted. */
+   public interface DetachedInput extends IInput {
+      AEKey craftedKey();
+      boolean emittable();
+   }
+   public interface Scope extends AutoCloseable { @Override void close(); }
+   private static final class State {
+      final Map<IPatternDetails, CraftingBytecode> compiled = new ConcurrentHashMap<>();
+      final Map<AEKey, java.util.Set<AEKey>> fuzzy = new ConcurrentHashMap<>();
+      final java.util.Set<AEKey> processing = ConcurrentHashMap.newKeySet();
+      final java.util.Set<AEKey> exact = ConcurrentHashMap.newKeySet();
+   }
+   private static final ThreadLocal<State> STATE = ThreadLocal.withInitial(State::new);
+   public static Scope openScope() {
+      State previous = STATE.get();
+      STATE.set(new State());
+      return () -> STATE.set(previous);
+   }
    private static final Map<IPatternDetails, CraftingBytecode> COMPILED_PATTERNS = new ConcurrentHashMap<>();
 
    /**
@@ -93,6 +112,7 @@ public class PatternCompiler {
       if (pattern == null) {
          return false;
       }
+      if (pattern instanceof DetachedPattern) return false;
       // Crafting patterns (AECraftingPattern) run in the ME molecular assembler and
       // implement IMolecularAssemblerSupportedPattern; everything else (AE processing
       // patterns, custom machine patterns like GTL's fake-craft) is a processing recipe.
@@ -102,8 +122,8 @@ public class PatternCompiler {
    /** True if {@code key} is an input of a processing recipe with default fuzzy matching.
     *  AE2-native exact processing inputs (e.g. bee_type honeycombs) return false. */
    public static boolean isProcessingInput(AEKey key) {
-      return key != null && PROCESSING_INPUT_KEYS.contains(key)
-            && !EXACT_PROCESSING_KEYS.contains(key);
+      return key != null && STATE.get().processing.contains(key)
+            && !STATE.get().exact.contains(key);
    }
 
    /** Mark {@code key} as an EXACT processing input (no NBT-variant substitution). */
@@ -111,13 +131,13 @@ public class PatternCompiler {
       if (key == null) {
          return;
       }
-      PROCESSING_INPUT_KEYS.remove(key);
-      EXACT_PROCESSING_KEYS.add(key);
+      STATE.get().processing.remove(key);
+      STATE.get().exact.add(key);
    }
 
    public static void clearProcessingInputKeys() {
-      PROCESSING_INPUT_KEYS.clear();
-      EXACT_PROCESSING_KEYS.clear();
+      STATE.get().processing.clear();
+      STATE.get().exact.clear();
    }
 
    /** Register every input variant group of {@code pattern} (call once per pattern at encode time). */
@@ -149,11 +169,11 @@ public class PatternCompiler {
                   && possibleInputs[0] != null && possibleInputs[0].what() != null) {
                if (nativeAE2Processing) {
                   // Exact: move to the EXACT set so isProcessingInput() returns false.
-                  EXACT_PROCESSING_KEYS.add(possibleInputs[0].what());
+                  STATE.get().exact.add(possibleInputs[0].what());
                } else {
                   // Third-party default-fuzzy: remember the primary key so the VM matches
                   // it against the item's full fuzzy family at runtime.
-                  PROCESSING_INPUT_KEYS.add(possibleInputs[0].what());
+                  STATE.get().processing.add(possibleInputs[0].what());
                }
             }
          }
@@ -168,7 +188,7 @@ public class PatternCompiler {
          }
          if (group.size() > 1) {
             for (AEKey k : group) {
-               FUZZY_GROUPS.merge(k, group, (a, b) -> {
+               STATE.get().fuzzy.merge(k, group, (a, b) -> {
                   a.addAll(b);
                   return a;
                });
@@ -179,14 +199,14 @@ public class PatternCompiler {
 
    /** The full set of acceptable variants for {@code key} (always contains {@code key} itself). */
    public static java.util.Set<AEKey> getFuzzyGroup(AEKey key) {
-      java.util.Set<AEKey> group = FUZZY_GROUPS.get(key);
+      java.util.Set<AEKey> group = STATE.get().fuzzy.get(key);
       return group != null ? group : java.util.Set.of(key);
    }
 
    public static void clearFuzzyGroups() {
-      FUZZY_GROUPS.clear();
-      PROCESSING_INPUT_KEYS.clear();
-      EXACT_PROCESSING_KEYS.clear();
+      STATE.get().fuzzy.clear();
+      STATE.get().processing.clear();
+      STATE.get().exact.clear();
    }
 
    /**
@@ -241,7 +261,7 @@ public class PatternCompiler {
       // crafted: skip them instead of letting compilePattern NPE and dragging the whole
       // request into a native fallback (stall).
       if (effective != null && hasUsableOutput(effective) && effective.getInputs() != null) {
-         COMPILED_PATTERNS.computeIfAbsent(effective, PatternCompiler::compilePattern);
+         STATE.get().compiled.computeIfAbsent(effective, PatternCompiler::compileOrderedPattern);
       }
    }
 
@@ -260,196 +280,115 @@ public class PatternCompiler {
    }
 
    public static CraftingBytecode getCompiled(IPatternDetails pattern) {
-      return COMPILED_PATTERNS.get(unwrapScaled(pattern));
+      return STATE.get().compiled.get(unwrapScaled(pattern));
    }
 
    public static CraftingBytecode compileRequest(IPatternDetails pattern, long requestedAmount) {
+      return compileRequest(pattern, BigInteger.valueOf(requestedAmount));
+   }
+
+   public static CraftingBytecode compileRequest(AEKey output, BigInteger requestedAmount) {
+      if (requestedAmount.signum() <= 0) throw new IllegalArgumentException("positive crafting request required");
+      var builder = new CraftingBytecode.Builder();
+      int key = builder.addConstant(output);
+      builder.setOutput(key, requestedAmount);
+      builder.emitPushAmount(requestedAmount);
+      builder.emitCallByKey(key);
+      return builder.build();
+   }
+
+   public static CraftingBytecode compileRequest(IPatternDetails pattern, BigInteger requestedAmount) {
+      if (requestedAmount.signum() <= 0) throw new IllegalArgumentException("positive crafting request required");
       IPatternDetails effective = unwrapScaled(pattern);
-      CraftingBytecode patternBytecode = COMPILED_PATTERNS.get(effective);
+      CraftingBytecode patternBytecode = STATE.get().compiled.get(effective);
       if (patternBytecode == null) {
          compileIfAbsent(effective);
-         patternBytecode = COMPILED_PATTERNS.get(effective);
+         patternBytecode = STATE.get().compiled.get(effective);
          if (patternBytecode == null) {
             throw new IllegalStateException("Failed to compile pattern: " + pattern);
          }
       }
 
-      long outputPerCraft = patternBytecode.getOutputAmountPerCraft();
+      BigInteger outputPerCraft = patternBytecode.getExactOutputAmountPerCraft();
       // (v1.12.x GTL BIG-ORDER FIX) Saturating ceil-div — (a + b - 1) overflows to a
       // negative craft count for requestedAmount near Long.MAX_VALUE (10^18+ orders):
       // e.g. MAX + 2 - 1 wraps to Long.MIN_VALUE, / 2 → negative → the plan silently
       // crafts nothing ("大数量订单假阴/卡死"). a/b + (a%b!=0) never overflows.
-      long craftTimes = ceilDiv(requestedAmount, outputPerCraft);
+      BigInteger craftTimes = ceilDiv(requestedAmount, outputPerCraft);
       CraftingBytecode.Builder builder = new CraftingBytecode.Builder();
       int outputIdx = builder.addConstant(patternBytecode.getOutput());
       builder.setOutput(outputIdx, requestedAmount);
       // (v1.10.8) Use the UNWRAPPED (original) pattern as the plan's pattern key — never the
       // virtual scaled wrapper — so AE2's CPU / getProviders / furnace pushPattern all match.
       int patternIdx = builder.addPattern(effective);
-      builder.emitPushLong(craftTimes);
+      builder.emitPushAmount(craftTimes);
       builder.emit(Opcode.CALL);
       builder.emitShort(patternIdx);
       return builder.build();
    }
 
-   private static CraftingBytecode compilePattern(IPatternDetails pattern) {
-      // (v1.12.x GTL DEFENSIVE) Never compile a pattern without a usable primary output
-      // (compileIfAbsent already filters; this guards direct computeIfAbsent callers).
-      if (!hasUsableOutput(pattern)) {
-         return null;
+   private static CraftingBytecode compileOrderedPattern(IPatternDetails pattern) {
+      // #208: a slot's units/returns cannot be reconstructed from a global fuzzy-key union.
+      var builder = new CraftingBytecode.Builder();
+      var primary = pattern.getPrimaryOutput();
+      if (primary.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
+      builder.setOutput(builder.addConstant(primary.what()), primary.amount());
+      int patternIndex = builder.addPattern(pattern);
+      var inputs = pattern.getInputs();
+      for (int slot = 0; slot < inputs.length; slot++) {
+         var alternatives = inputs[slot].getPossibleInputs();
+         if (alternatives.length == 0 || inputs[slot].getMultiplier() <= 0
+               || java.util.Arrays.stream(alternatives).anyMatch(t -> t == null || t.amount() <= 0))
+            throw new IllegalArgumentException("positive pattern input required");
+         BigInteger amount = BigInteger.valueOf(alternatives[0].amount())
+               .multiply(BigInteger.valueOf(inputs[slot].getMultiplier()));
+         builder.emit(Opcode.DUP);
+         builder.emitPushAmount(amount);
+         builder.emit(Opcode.MUL);
+         builder.emit(Opcode.REQUEST_INPUT);
+         builder.emitShort(slot);
       }
-      // (v1.9.13) 编码阶段：检测样板是否开启模糊匹配/流体替换（getPossibleInputs()
-      // 返回多个变体，如灰色羊毛样板可接受白色羊毛）。把该样板的所有输入变体注册为
-      // 模糊组——A、B 可替换时，A→C、B→C 都视为可接受输入路径，供 VM 的库存缺失
-      // 判断识别"灰色羊毛可由白色羊毛满足"。此处在 compilePattern 内注册，保证任何
-      // 样板来源（分子装配室/样板终端/ME 接口）编译时都生效。
-      registerFuzzyGroups(pattern);
-      CraftingBytecode.Builder builder = new CraftingBytecode.Builder();
-      GenericStack primaryOutput = pattern.getPrimaryOutput();
-      AEKey outputKey = primaryOutput.what();
-      long outputPerCraft = primaryOutput.amount();
-      int outputIdx = builder.addConstant(outputKey);
-      int patternIdx = builder.addPattern(pattern);
-      builder.setOutput(outputIdx, outputPerCraft);
-      // Compile logging disabled (v1.9.1) — keep only total calc time.
-      // AE2VMAddon.LOGGER
-      //    .info(
-      //       "[AE2-VM] Compiling pattern: {} x {} ({} inputs, {} outputs)",
-      //       new Object[]{outputPerCraft, outputKey, pattern.getInputs().length, pattern.getOutputs().size()}
-      //    );
-      builder.emit(Opcode.DUP);
-      builder.emitRecordPattern(patternIdx);
-
-      // (v1.12.x GTL DEFENSIVE) Null inputs = not compilable (compileIfAbsent already
-      // filters; this guards direct computeIfAbsent callers from the same pattern).
-      if (pattern.getInputs() == null) {
-         return null;
-      }
-      IPatternDetails.IInput[] patternInputs = pattern.getInputs();
-      for (IInput inputEntry : patternInputs) {
-         GenericStack[] possibleInputs = inputEntry.getPossibleInputs();
-         if (possibleInputs == null || possibleInputs.length == 0) {
-            continue;
-         }
-            GenericStack inputStack = possibleInputs[0];
-            AEKey inputKey = inputStack.what();
-            long multiplier = inputEntry.getMultiplier();
-            // Fix (AE2 1.20.1 faithful): per-craft consumption is multiplier × amount,
-            // not just multiplier. Fixes fluid/bucket per-craft amounts (1 bucket of
-            // water = 1000 mB, not 1 mB) and any other input with amount > 1.
-            long totalPerCraft = multiplier * Math.max(1, inputStack.amount());
-            // (v1.10.x CATALYST) Returned/catalyst input: the input is handed back unchanged
-            // after every firing (getRemainingKey returns the input itself), so the whole
-            // batch needs only `amount` as a seed — NOT amount × times. AE2's native
-            // container/catalyst handling extracts the container and re-emits it; the closed
-            // form is `unitsFor(times) = amount` (a catalyst seed serves the whole batch).
-            // This is the GTL greenhouse fake-craft / crafting-template case where a block
-            // (or template) must be present but is never consumed. Emit a one-time
-            // CATALYST_SEED demand instead of the per-craft CALL_BY_KEY/EXTRACT chain.
-            AEKey remainingKey = inputEntry.getRemainingKey(inputKey);
-            if (remainingKey != null && remainingKey.equals(inputKey)) {
-               // (v1.10.x DURABILITY) A finite-use (durability) tool is a returned input that
-               // degrades: one amount-sized unit survives `uses` firings, so a batch of
-               // `times` firings needs amount × ceil(times/uses) tools (the "成环差分" closed
-               // form) — NOT one seed (catalyst) and NOT amount × times (consumed). Distinguish
-               // via the IFiniteUseInput capability (durabilityUses() == MAX_VALUE → catalyst).
-               long uses = Long.MAX_VALUE;
-               if (inputEntry instanceof IFiniteUseInput f) {
-                  uses = f.durabilityUses();
-               }
-               int seedIdx = builder.addConstant(inputKey);
-               if (uses == Long.MAX_VALUE) {
-                  builder.emitPushLong(totalPerCraft);
-                  builder.emit(Opcode.CATALYST_SEED);
-               } else {
-                  builder.emitPushLong(totalPerCraft);
-                  builder.emitPushLong(uses);
-                  builder.emit(Opcode.DURABILITY_TOOL);
-               }
-               builder.emitShort(seedIdx);
-               continue;
-            }
-            // AE2VMAddon.LOGGER
-            //    .info(
-            //       "[AE2-VM]   Input: key={}, stackAmt={}, multiplier={}, totalPerCraft={}", new Object[]{inputKey, inputStack.amount(), multiplier, totalPerCraft}
-            //    );
-            int inputKeyIdx = builder.addConstant(inputKey);
-            builder.emit(Opcode.DUP);
-            builder.emitPushLong(totalPerCraft);
-            builder.emit(Opcode.MUL);
-            // FIX (false-missing): ALWAYS schedule the sub-craft with the FULL
-            // per-craft need BEFORE consuming stock. The old code extracted stock
-            // first and CALL_BY_KEY'd only the residual — but the 1-craft capture
-            // runs against the LIVE network, so any small stock (enough for 1 craft)
-            // dropped the residual to 0 → CALL_BY_KEY(req=0) → NO sub-craft was
-            // scheduled. At aggregation (scaled to N crafts) that stock was
-            // exhausted and the whole demand fell to missing even though a pattern
-            // existed (gold_ingot 181K missing etc.). Now the sub-craft is always
-            // scheduled; the EXTRACT chain after it consumes the crafted output
-            // first, then any remaining stock. Pure compile-time change — the VM's
-            // opcodes are unchanged.
-            builder.emit(Opcode.DUP);            // (v1.10.x video fix) Mark the slot when replacement is enabled
-            // (getPossibleInputs() returns more than one variant): only then may the
-            // leaf availability check and the stock-aware aggregation satisfy this
-            // slot with a substitute. An EXACT slot (single possible input) can only
-            // ever use its primary key — applying the global fuzzy group to it made
-            // the plan extract a substitute the exact pattern cannot consume, and the
-            // AE2 CPU execution stalled at zero progress (the 2026-08-09 video bug).
-            if (possibleInputs.length > 1) {
-               builder.emitFuzzySlot();
-            }            builder.emitCallByKey(inputKeyIdx);
-            // Fuzzy matching / fluid substitution: consume the crafted output and
-            // each possible variant's stock; each EXTRACT's shortfall feeds the next.
-            for (GenericStack possible : possibleInputs) {
-               if (possible == null || possible.what() == null) {
-                  continue;
-               }
-               int pIdx = builder.addConstant(possible.what());
-               builder.emitExtractIngredient(pIdx);
-            }
-            builder.emit(Opcode.POP);
-      }
-
-      for (GenericStack output : pattern.getOutputs()) {
-         int outIdx = builder.addConstant(output.what());
+      builder.emit(Opcode.RETURN_CONTAINERS);
+      for (var output : pattern.getOutputs()) {
+         if (output.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
+         int index = builder.addConstant(output.what());
          builder.emit(Opcode.DUP);
          builder.emitPushLong(output.amount());
          builder.emit(Opcode.MUL);
-         builder.emitInsertOutput(outIdx);
+         builder.emitInsertOutput(index);
       }
-
-      builder.emit(Opcode.POP);
+      builder.emitRecordPattern(patternIndex);
       builder.emit(Opcode.RETURN);
       return builder.build();
    }
 
+
    public static void invalidate(IPatternDetails pattern) {
-      COMPILED_PATTERNS.remove(unwrapScaled(pattern));
+      STATE.get().compiled.remove(unwrapScaled(pattern));
    }
 
    public static void clearCache() {
-      COMPILED_PATTERNS.clear();
+      STATE.get().compiled.clear();
    }
 
    public static int getCompiledCount() {
-      return COMPILED_PATTERNS.size();
+      return STATE.get().compiled.size();
    }
 
    public static IPatternDetails findCompiledByOutput(AEKey outputKey) {
       if (outputKey != null && outputKey.getId() != null) {
-         String targetId = outputKey.getId().toString();
 
-         for (Entry<IPatternDetails, CraftingBytecode> entry : COMPILED_PATTERNS.entrySet()) {
+         for (Entry<IPatternDetails, CraftingBytecode> entry : STATE.get().compiled.entrySet()) {
             GenericStack patternOutput = entry.getKey().getPrimaryOutput();
             if (patternOutput != null && patternOutput.what() != null) {
                ResourceLocation patternId = patternOutput.what().getId();
-               if (patternId != null && targetId.equals(patternId.toString())) {
+               if (outputKey.equals(patternOutput.what())) {
                   return entry.getKey();
                }
             }
 
             for (GenericStack out : entry.getKey().getOutputs()) {
-               if (out != null && out.what() != null && out.what().getId() != null && targetId.equals(out.what().getId().toString())) {
+               if (out != null && outputKey.equals(out.what())) {
                   return entry.getKey();
                }
             }
@@ -472,6 +411,17 @@ public class PatternCompiler {
 
    public static CraftingBytecode compileRequest(Object network, IPatternDetails pattern, long requestedAmount) {
       return compileRequest(pattern, requestedAmount);
+   }
+
+   public static CraftingBytecode compileRequest(Object network, IPatternDetails pattern, BigInteger requestedAmount) {
+      return compileRequest(pattern, requestedAmount);
+   }
+
+   public static BigInteger ceilDiv(BigInteger amount, BigInteger output) {
+      if (amount.signum() < 0 || output.signum() <= 0)
+         throw new IllegalArgumentException("invalid exact division");
+      var divided = amount.divideAndRemainder(output);
+      return divided[1].signum() == 0 ? divided[0] : divided[0].add(BigInteger.ONE);
    }
 
    public static IPatternDetails findCompiledByOutput(Object network, AEKey outputKey) {

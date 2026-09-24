@@ -6,9 +6,21 @@ bytecode calculations on bounded, cancellable worker threads. It does not
 depend on ACO graph/capture classes. VmAccounting is the optional exact-stock
 and finished-wide-result contract.
 
-The legacy upstream CraftingVM/bootstrap is not included in this native JAR.
-This is new fork integration using exact-engine's ordered bytecode VM, not a
-claim that every original upstream VM feature was retained unchanged.
+The upstream compiler/stack-bytecode core is compiled into this native JAR.
+The unsafe one-craft aggregation was replaced inside the VM fork with ordered
+input instructions and guarded block replay. This is a semantic extension of
+the VM, not a claim that upstream's original aggregation was correct for every
+AE2 recipe. The copied rc.4 `ExactBranchVM` evaluator is removed. The upstream
+mod bootstrap, blocklist, config and mixins are not included; this module owns
+the controlled AE2 entry. ACO supplies stock/result accounting only.
+
+The quantity stack, scratch inventory, operation counts, missing amounts,
+returns and rational byte charges use BigInteger. A replay verifies every
+inventory comparison over the skipped interval, preserves peak reservation,
+and accounts for periodic damaged-tool states. Failed producer trials roll
+back their quantities without discarding the observations used for replay
+guards. Pattern bytecode is compiled once per captured request scope; no
+stock-dependent plan is shared between requests.
 
 ## Build and Test
 
@@ -30,6 +42,25 @@ output; the native module never compiles against ACO classes.
 with Forge Jar-in-Jar metadata. `verifyExactVmBundle` checks both nested
 artifacts, bootstrap manifests, class boundaries and licenses. Do not invoke
 the upstream root build/deployment tasks as a substitute.
+`vmNativeSourcesJar` creates the corresponding compiler, interpreter, adapter
+and resource source archive. Distribute it alongside a prerelease of the bundle.
+
+## Diagnostics
+
+Routine orders do not produce individual INFO or DEBUG messages by default.
+Activity emits one INFO summary at most every 60 seconds: started/completed,
+missing plans, cancellations, failures, recaptures, slow completions, and
+mean/max completion milliseconds within that window. An idle VM has no timer
+thread and produces no periodic messages.
+
+Slow means at least five seconds. Running and slow-completion samples are
+each globally limited to one per 30 seconds across orders. Failure exceptions
+and stack traces remain ERROR and are not rate-limited. To investigate an
+individual order, explicitly enable per-order DEBUG traces with the Java
+argument `-Dae2vm.diagnostics.verbose=true` (and a logger accepting DEBUG).
+Changing the logger to DEBUG alone does not enable per-order traces.
+
+These diagnostics do not alter calculation, cancellation or exact accounting.
 
 ## Boundaries
 

@@ -6,6 +6,10 @@ import appeng.api.networking.IGrid;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
+import appeng.api.stacks.AEItemKey;
+import com.ae2vm.addon.compiler.PatternCompiler;
+import com.ae2vm.addon.vm.CraftingVM;
+import com.ae2vm.addon.vm.VmSimulationState;
 import com.syaru.ae2vm.exact.ExactBranchBytecode;
 import com.syaru.ae2vm.exact.ExactBranchInputRules;
 import java.math.BigInteger;
@@ -36,10 +40,15 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     private final Map<String, Captured> patterns = new LinkedHashMap<>();
     private final Map<Slot, Input<AEKey>> inputs = new LinkedHashMap<>();
     private final Map<Query, Observation<AEKey>> observations = new LinkedHashMap<>();
+    private final java.util.function.LongConsumer progress;
 
     NativeVmCapture(IGrid grid, Level level, VmAccounting accounting) {
+        this(grid, level, accounting, ignored -> { });
+    }
+    NativeVmCapture(IGrid grid, Level level, VmAccounting accounting, java.util.function.LongConsumer progress) {
         this.grid = grid;
         this.level = level;
+        this.progress = progress;
         var start = callServer(() -> {
             var counts = accounting == null
                     ? ordinaryStock(grid.getStorageService().getInventory().getAvailableStacks())
@@ -62,6 +71,130 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     }
 
     BigInteger amount(AEKey key) { return stock.amount(key); }
+
+    /** Compile and run the upstream VM, never the rc.4 branch interpreter. */
+    VmQuantities plan(AEKey root, BigInteger requested, boolean craftLess) {
+        var queue = new java.util.ArrayDeque<AEKey>();
+        var seen = new java.util.LinkedHashSet<AEKey>();
+        queue.add(root); seen.add(root);
+        // One handoff processes a bounded batch, rather than waiting one tick per key.
+        while (!queue.isEmpty()) callServer(() -> {
+            long deadline = System.nanoTime() + 2_000_000L;
+            for (int batch = 0; batch < 32 && !queue.isEmpty(); batch++) {
+                AEKey key = queue.remove();
+                emittable(key);
+                for (var code : candidates(key)) {
+                    var captured = patterns.get(code.id());
+                    for (int slot = 0; slot < captured.shape().inputs().size(); slot++) {
+                        var selected = input(code, slot);
+                        if (seen.add(selected.craftedKey())) queue.add(selected.craftedKey());
+                        for (var template : selected.templates()) {
+                            if (seen.add(template.key())) queue.add(template.key());
+                        }
+                    }
+                }
+                if (System.nanoTime() >= deadline) break;
+            }
+            return null;
+        });
+        Map<String, FrozenPattern> frozen = new LinkedHashMap<>();
+        var entries = new ArrayList<>(patterns.entrySet());
+        var known = new java.util.LinkedHashSet<AEKey>(stock.amounts().keySet());
+        known.addAll(seen);
+        entries.forEach(entry -> entry.getValue().shape().outputs().forEach(output -> known.add(output.what())));
+        var knownKeys = newIndex();
+        known.forEach(knownKeys::add);
+        int knownBefore;
+        do {
+        knownBefore = known.size();
+        for (int start = 0; start < entries.size();) {
+            final int first = start;
+            int next = callServer(() -> {
+                long deadline = System.nanoTime() + 2_000_000L;
+                int i = first;
+                for (; i < entries.size(); i++) {
+                    var entry = entries.get(i);
+                    var shape = entry.getValue().shape();
+                    var slots = new IPatternDetails.IInput[shape.inputs().size()];
+                    var code = codeByPattern.get(entry.getValue().pattern());
+                    for (int slot = 0; slot < slots.length; slot++) {
+                        var capturedInput = input(code, slot);
+                        var accepted = new LinkedHashMap<AEKey, Boolean>();
+                        var remaining = new LinkedHashMap<AEKey, AEKey>();
+                        var candidates = new java.util.ArrayDeque<AEKey>();
+                        var visited = new java.util.HashSet<AEKey>();
+                        for (var template : capturedInput.templates()) {
+                            candidates.add(template.key());
+                            candidates.addAll(knownKeys.fuzzy(template.key()));
+                        }
+                        while (!candidates.isEmpty()) {
+                            var variant = candidates.remove();
+                            if (!visited.add(variant)) continue;
+                            if (capturedInput.templates().stream().noneMatch(t -> t.key().fuzzyEquals(variant, FuzzyMode.IGNORE_ALL))) continue;
+                            var observation = observe(new Slot(entry.getKey(), slot), variant);
+                            accepted.put(variant, observation.valid());
+                            if (observation.remainder() != null) {
+                                remaining.put(variant, observation.remainder());
+                                if (known.add(observation.remainder())) knownKeys.add(observation.remainder());
+                                candidates.add(observation.remainder());
+                            }
+                        }
+                        accepted.keySet().forEach(stock::amount);
+                        slots[slot] = new FrozenInput(shape.inputs().get(slot).templates().toArray(GenericStack[]::new),
+                                shape.inputs().get(slot).multiplier().longValueExact(), Map.copyOf(remaining),
+                                Map.copyOf(accepted), capturedInput.craftedKey(), capturedInput.emittable());
+                    }
+                    frozen.put(entry.getKey(), new FrozenPattern(entry.getValue().pattern().getDefinition(),
+                            slots, shape.outputs().toArray(GenericStack[]::new)));
+                    if (System.nanoTime() >= deadline) return i + 1;
+                }
+                return i;
+            });
+            start = next;
+        }
+        } while (known.size() != knownBefore);
+        Map<IPatternDetails, String> ids = new IdentityHashMap<>();
+        frozen.forEach((id, pattern) -> ids.put(pattern, id));
+        Map<AEKey, List<IPatternDetails>> byOutput = new LinkedHashMap<>();
+        programs.forEach((key, codes) -> byOutput.put(key, codes.stream()
+                .map(code -> (IPatternDetails) frozen.get(code.id())).toList()));
+        try (var scope = PatternCompiler.openScope()) {
+            frozen.values().forEach(PatternCompiler::compileIfAbsent);
+            var vm = new CraftingVM(this, key -> {
+                var choices = byOutput.getOrDefault(key, List.of());
+                return choices.isEmpty() ? null : choices.get(0);
+            });
+            vm.setAllPatternsResolver(key -> byOutput.getOrDefault(key, List.of()));
+            vm.setEmitterResolver(key -> Boolean.TRUE.equals(emitters.get(key)));
+            vm.setProgressListener(progress);
+            var result = vm.execute(PatternCompiler.compileRequest(root, requested), new VmSimulationState(stock.amounts()), craftLess);
+            Map<String, BigInteger> crafts = new LinkedHashMap<>();
+            result.patternTimes().forEach((pattern, count) -> crafts.merge(ids.get(pattern), count, BigInteger::add));
+            return new VmQuantities(root, result.finalOutput().amount(), crafts,
+                    result.usedItems().quantities(), result.emittedItems().quantities(),
+                    result.missingItems().quantities(), result.bytes(), Map.of(),
+                    result.multiplePaths(), vm.instructions(), vm.work(), vm.skippedIterations());
+        }
+    }
+
+    private record FrozenInput(GenericStack[] templates, long multiplier, Map<AEKey, AEKey> remaining,
+            Map<AEKey, Boolean> accepted, AEKey craftedKey, boolean emittable)
+            implements PatternCompiler.DetachedInput {
+        public GenericStack[] getPossibleInputs() { return templates.clone(); }
+        public long getMultiplier() { return multiplier; }
+        public boolean isValid(AEKey key, Level ignored) {
+            var valid = accepted.get(key);
+            if (valid == null) throw new IllegalStateException("VM input observation missing: " + key);
+            return valid;
+        }
+        public AEKey getRemainingKey(AEKey key) { return remaining.get(key); }
+    }
+    private record FrozenPattern(AEItemKey definition, IPatternDetails.IInput[] inputs, GenericStack[] outputs)
+            implements PatternCompiler.DetachedPattern {
+        public AEItemKey getDefinition() { return definition; }
+        public IPatternDetails.IInput[] getInputs() { return inputs.clone(); }
+        public GenericStack[] getOutputs() { return outputs.clone(); }
+    }
 
     boolean emittable(AEKey key) {
         return emitters.computeIfAbsent(key, k -> callServer(() -> grid.getCraftingService().canEmitFor(k)));
@@ -144,33 +277,39 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     void validate() {
         // Stock is intentionally NOT compared: the result describes its snapshot;
         // AE2/exact execution must reserve against current storage at submission.
-        for (var entry : producers.entrySet()) callServer(() -> {
+        List<Runnable> checks = new ArrayList<>();
+        for (var entry : producers.entrySet()) checks.add(() -> {
             if (!entry.getValue().equals(List.copyOf(grid.getCraftingService().getCraftingFor(entry.getKey()))))
                 throw new NativeVm.Changed("provider binding changed");
-            return null;
         });
-        for (var captured : patterns.values()) callServer(() -> {
+        for (var captured : patterns.values()) checks.add(() -> {
             if (!captured.shape().equals(shape(captured.pattern()))) throw new NativeVm.Changed("pattern shape changed");
-            return null;
         });
-        for (var entry : inputs.entrySet()) callServer(() -> {
+        for (var entry : inputs.entrySet()) checks.add(() -> {
             var actual = patterns.get(entry.getKey().id()).pattern().getInputs()[entry.getKey().index()];
             var expected = entry.getValue();
             if (!Objects.equals(expected.craftedKey(), selectCrafted(actual, expected.templates()))
                     || expected.emittable() != grid.getCraftingService().canEmitFor(expected.templates().get(0).key()))
                 throw new NativeVm.Changed("input selection changed");
-            return null;
         });
-        for (var entry : observations.entrySet()) callServer(() -> {
+        for (var entry : observations.entrySet()) checks.add(() -> {
             var slot = entry.getKey().slot();
             var actual = patterns.get(slot.id()).pattern().getInputs()[slot.index()];
             if (!entry.getValue().equals(read(actual, entry.getKey().key()))) throw new NativeVm.Changed("input observation changed");
-            return null;
         });
-        for (var entry : emitters.entrySet()) callServer(() -> {
+        for (var entry : emitters.entrySet()) checks.add(() -> {
             if (entry.getValue() != grid.getCraftingService().canEmitFor(entry.getKey())) throw new NativeVm.Changed("emitter changed");
-            return null;
         });
+        for (int start = 0; start < checks.size();) {
+            final int first = start;
+            start = callServer(() -> {
+                long deadline = System.nanoTime() + 2_000_000L;
+                int index = first;
+                do { checks.get(index++).run(); }
+                while (index < checks.size() && index - first < 32 && System.nanoTime() < deadline);
+                return index;
+            });
+        }
     }
 
     Map<String, IPatternDetails> bindings() {

@@ -3,11 +3,11 @@ package com.ae2vm.addon.vm;
 /**
  * Stack-based Virtual Machine Opcodes for AE2 Crafting Calculation
  * 
- * Stack convention: All values are long integers representing item counts.
+ * Stack quantities are BigInteger; small literals may be encoded as signed long.
  * Item references are stored in a constant pool and referenced by index.
  * 
  * Design principle: Compile patterns once, execute many times.
- * All recursion is eliminated at compile time - bytecode is completely flat.
+ * Pattern blocks are flat; input instructions resolve ordered child requests.
  */
 public enum Opcode {
     /**
@@ -23,6 +23,15 @@ public enum Opcode {
      * Push a literal long value onto stack.
      */
     PUSH_LONG(0x01),
+
+    /** PUSH_BIG_INTEGER <quantityPoolIndex:short>; exact, including values beyond signed long. */
+    PUSH_BIG_INTEGER(0x15),
+
+    /** REQUEST_INPUT <slot:short>; pops primary-unit demand, preserves slot alternatives and returns. */
+    REQUEST_INPUT(0x16),
+
+    /** Apply the current frame's container returns after every input has been requested. */
+    RETURN_CONTAINERS(0x17),
     
     /**
      * ADD
@@ -136,11 +145,9 @@ public enum Opcode {
     
     /**
      * INSERT_OUTPUT <constantPoolIndex:short>
-     * Stack: (..., craftTimes) -> (..., craftTimes)
-     * Insert craftTimes * outputAmount of constantPool[idx] into simulation inventory.
-     * Does NOT pop craftTimes — it's still needed for subsequent inputs.
-     * CRITICAL for recursive crafting: sub-pattern outputs become available
-     * for parent's subsequent EXTRACT_INGREDIENT calls.
+     * Stack: (..., amount) -> (...)
+     * Pop an already-scaled exact output amount into the simulation inventory.
+     * Child outputs become available to subsequent input requests.
      */
     INSERT_OUTPUT(0x11),
 

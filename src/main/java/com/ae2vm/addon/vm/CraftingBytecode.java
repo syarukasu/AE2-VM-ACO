@@ -6,6 +6,10 @@ import appeng.api.stacks.GenericStack;
 
 import java.util.Arrays;
 import java.util.List;
+import java.math.BigInteger;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
 
 /**
  * Compiled bytecode for a crafting tree.
@@ -46,16 +50,27 @@ public class CraftingBytecode {
     /**
      * Output amount per craft
      */
-    private final long outputAmountPerCraft;
+    private final BigInteger outputAmountPerCraft;
+    private final BigInteger[] quantityPool;
     
     public CraftingBytecode(AEKey[] constantPool, IPatternDetails[] patternPool, byte[] code, 
                            int outputIndex, long outputAmountPerCraft) {
+        this(constantPool, patternPool, code, outputIndex, BigInteger.valueOf(outputAmountPerCraft),
+                new BigInteger[0]);
+    }
+
+    public CraftingBytecode(AEKey[] constantPool, IPatternDetails[] patternPool, byte[] code,
+                           int outputIndex, BigInteger outputAmountPerCraft, BigInteger[] quantityPool) {
         this.constantPool = constantPool;
         this.patternPool = patternPool;
         this.code = code;
         this.outputIndex = outputIndex;
-        this.outputAmountPerCraft = outputAmountPerCraft;
-        this.hash = Arrays.hashCode(code) * 31 + Arrays.hashCode(constantPool);
+        this.outputAmountPerCraft = Objects.requireNonNull(outputAmountPerCraft);
+        this.quantityPool = quantityPool.clone();
+        if (outputAmountPerCraft.signum() < 0) throw new IllegalArgumentException("negative output amount");
+        for (var quantity : this.quantityPool) Objects.requireNonNull(quantity);
+        this.hash = Objects.hash(Arrays.hashCode(code), Arrays.hashCode(constantPool),
+                Arrays.hashCode(patternPool), outputIndex, outputAmountPerCraft, Arrays.hashCode(this.quantityPool));
     }
     
     public AEKey[] getConstantPool() {
@@ -75,15 +90,19 @@ public class CraftingBytecode {
     }
     
     public long getOutputAmountPerCraft() {
-        return outputAmountPerCraft;
+        return outputAmountPerCraft.longValueExact();
     }
+
+    public BigInteger getExactOutputAmountPerCraft() { return outputAmountPerCraft; }
+    public BigInteger getQuantity(int index) { return quantityPool[index]; }
+    public BigInteger[] getQuantityPool() { return quantityPool.clone(); }
     
     public AEKey getOutput() {
         return constantPool[outputIndex];
     }
     
     public GenericStack getOutputStack() {
-        return new GenericStack(getOutput(), outputAmountPerCraft);
+        return new GenericStack(getOutput(), outputAmountPerCraft.longValueExact());
     }
     
     @Override
@@ -94,6 +113,8 @@ public class CraftingBytecode {
         return hash == that.hash && 
                Arrays.equals(constantPool, that.constantPool) && 
                Arrays.equals(patternPool, that.patternPool) &&
+               outputIndex == that.outputIndex && outputAmountPerCraft.equals(that.outputAmountPerCraft) &&
+               Arrays.equals(quantityPool, that.quantityPool) &&
                Arrays.equals(code, that.code);
     }
     
@@ -124,7 +145,8 @@ public class CraftingBytecode {
         private final List<IPatternDetails> patternPool = new java.util.ArrayList<>();
         private final java.io.ByteArrayOutputStream codeStream = new java.io.ByteArrayOutputStream();
         private int outputIndex = -1;
-        private long outputAmountPerCraft = 0;
+        private BigInteger outputAmountPerCraft = BigInteger.ZERO;
+        private final Map<BigInteger, Integer> quantityPool = new LinkedHashMap<>();
         
         public int addConstant(AEKey key) {
             int existing = constantPool.indexOf(key);
@@ -147,8 +169,12 @@ public class CraftingBytecode {
         }
         
         public void setOutput(int outputIndex, long amountPerCraft) {
+            setOutput(outputIndex, BigInteger.valueOf(amountPerCraft));
+        }
+
+        public void setOutput(int outputIndex, BigInteger amountPerCraft) {
             this.outputIndex = outputIndex;
-            this.outputAmountPerCraft = amountPerCraft;
+            this.outputAmountPerCraft = Objects.requireNonNull(amountPerCraft);
         }
         
         public void emit(Opcode op) {
@@ -156,6 +182,7 @@ public class CraftingBytecode {
         }
         
         public void emitShort(int value) {
+            if (value < 0 || value > 0xffff) throw new IllegalArgumentException("bytecode index outside unsigned short");
             codeStream.write((value >> 8) & 0xFF);
             codeStream.write(value & 0xFF);
         }
@@ -175,6 +202,21 @@ public class CraftingBytecode {
         public void emitPushLong(long value) {
             emit(Opcode.PUSH_LONG);
             emitLong(value);
+        }
+
+        /** Issue #208: wide coefficients and orders must never be encoded as truncated longs. */
+        public void emitPushAmount(BigInteger value) {
+            Objects.requireNonNull(value);
+            if (value.bitLength() <= 63) {
+                emitPushLong(value.longValueExact());
+                return;
+            }
+            int index = quantityPool.computeIfAbsent(value, ignored -> {
+                if (quantityPool.size() >= 65_536) throw new IllegalStateException("quantity pool is full");
+                return quantityPool.size();
+            });
+            emit(Opcode.PUSH_BIG_INTEGER);
+            emitShort(index);
         }
         
         public void emitExtractIngredient(int constantIndex) {
@@ -252,7 +294,8 @@ public class CraftingBytecode {
                 patternPool.toArray(new IPatternDetails[0]),
                 codeStream.toByteArray(),
                 outputIndex,
-                outputAmountPerCraft
+                outputAmountPerCraft,
+                quantityPool.keySet().toArray(new BigInteger[0])
             );
         }
     }
