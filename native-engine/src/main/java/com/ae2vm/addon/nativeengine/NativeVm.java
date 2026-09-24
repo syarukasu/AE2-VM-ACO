@@ -77,7 +77,7 @@ public final class NativeVm {
         var server = Objects.requireNonNull(level.getServer());
         if (requested.signum() <= 0) throw new IllegalArgumentException("positive VM order required");
         long order = ORDERS.incrementAndGet();
-        FutureTask<ICraftingPlan> task = new FutureTask<>(() -> compute(order, grid, level, output, requested, strategy)) {
+        FutureTask<ICraftingPlan> task = new FutureTask<>(() -> compute(order, grid, level, requester, output, requested, strategy)) {
             @Override protected void done() { ACTIVE.remove(this); }
         };
         ACTIVE.put(task, server);
@@ -86,7 +86,7 @@ public final class NativeVm {
         return task;
     }
 
-    private static ICraftingPlan compute(long order, IGrid grid, Level level, AEKey output,
+    private static ICraftingPlan compute(long order, IGrid grid, Level level, ICraftingSimulationRequester requester, AEKey output,
             BigInteger request, CalculationStrategy strategy) {
         long started = System.nanoTime();
         var timing = new NativeVmTiming();
@@ -98,7 +98,7 @@ public final class NativeVm {
                 try {
                     VmAccounting extension = accounting;
                     var capture = new NativeVmCapture(grid, level, extension, work -> DIAGNOSTICS.running(
-                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)), timing);
+                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)), timing, requester);
                     var result = capture.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS);
                     var bindings = capture.bindings();
                     BigInteger bytes = bytes(result);

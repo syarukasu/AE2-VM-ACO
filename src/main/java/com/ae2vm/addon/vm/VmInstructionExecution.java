@@ -168,6 +168,15 @@ final class VmInstructionExecution {
         var remaining = count;
         if (node.input == null) {
             remaining = remaining.subtract(state.extract(node.key, remaining));
+        } else if (node.input instanceof PatternCompiler.DetachedInput detached && detached.exactKey() != null) {
+            // #218: native processing inputs are exact, not a fuzzy NBT-family search.
+            var key = detached.exactKey();
+            var wanted = remaining.multiply(node.unit);
+            var taken = state.read(key, wanted).min(wanted).divide(node.unit);
+            if (taken.signum() > 0) {
+                state.extract(key, taken.multiply(node.unit));
+                remaining = remaining.subtract(taken);
+            }
         } else {
             // Use AE2's key index for ordering only; quantities are never stored as long.
             for (var template : node.input.getPossibleInputs()) {

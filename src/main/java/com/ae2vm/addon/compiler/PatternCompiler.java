@@ -18,6 +18,8 @@ public class PatternCompiler {
    public interface DetachedInput extends IInput {
       AEKey craftedKey();
       boolean emittable();
+      /** Non-null only for a captured input whose semantics require this exact key and no return. */
+      default AEKey exactKey() { return null; }
       /** Observe only candidates encountered by this VM request, in a server-owned batch. */
       default void prepareCandidates(java.util.Collection<AEKey> keys) { }
    }
