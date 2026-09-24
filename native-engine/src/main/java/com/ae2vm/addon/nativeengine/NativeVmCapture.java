@@ -49,6 +49,7 @@ final class NativeVmCapture {
     private final Map<String, Captured> patterns = new LinkedHashMap<>();
     private final Map<Slot, FrozenInput> inputs = new LinkedHashMap<>();
     private final Map<Query, Observation> observations = new LinkedHashMap<>();
+    private final Set<Query> consultedQueries = new LinkedHashSet<>();
     private final java.util.function.LongConsumer progress;
     private final NativeVmTiming timing;
 
@@ -173,8 +174,8 @@ final class NativeVmCapture {
         public boolean emittable() { return emittable; }
         public AEKey exactKey() {
             if (!nativeExact) return null;
-            var primary = observations.get(new Query(slot, templates[0].what()));
-            return primary != null && primary.valid() && primary.remainder() == null ? templates[0].what() : null;
+            var primary = observe(slot, templates[0].what());
+            return primary.valid() && primary.remainder() == null ? templates[0].what() : null;
         }
         public void prepareCandidates(java.util.Collection<AEKey> keys) {
             if (exactKey() != null) return;
@@ -399,7 +400,10 @@ final class NativeVmCapture {
     private Observation observe(Slot slot, AEKey key) {
         var query = new Query(slot, key);
         if (!observations.containsKey(query)) prepareQueries(List.of(query));
-        return Objects.requireNonNull(observations.get(query));
+        var observation = Objects.requireNonNull(observations.get(query));
+        consultedQueries.add(query);
+        if (observation.failure() != null) throw observation.failure();
+        return observation;
     }
 
     private void prepareQueries(List<Query> queries) {
@@ -409,7 +413,7 @@ final class NativeVmCapture {
                 long deadline = timing.now() + 2_000_000L;
                 int i = first;
                 do {
-                    captureQuery(queries.get(i++));
+                    captureQuery(queries.get(i++), true);
                 } while (i < queries.size() && i - first < 128 && timing.now() < deadline);
                 return i;
             });
@@ -418,6 +422,10 @@ final class NativeVmCapture {
     }
 
     private void captureQuery(Query query) {
+        captureQuery(query, false);
+    }
+
+    private void captureQuery(Query query, boolean speculative) {
         checkCancellation();
         if (observations.containsKey(query)) return;
         var slot = query.slot();
@@ -426,7 +434,18 @@ final class NativeVmCapture {
                     + ", observations=" + observations.size() + ", pattern=" + slot.id()
                     + ", slot=" + slot.index() + ", key=" + query.key());
         stock.amount(query.key());
-        observations.put(query, read(patterns.get(slot.id()).pattern().getInputs()[slot.index()], query.key()));
+        var input = patterns.get(slot.id()).pattern().getInputs()[slot.index()];
+        Observation observation;
+        try {
+            observation = read(input, query.key());
+        } catch (NativeVm.Changed | CancellationException failure) {
+            throw failure;
+        } catch (RuntimeException failure) {
+            if (!speculative) throw failure;
+            // Unused lookahead is not a plan dependency. Preserve the original failure if later consulted.
+            observation = new Observation(false, null, failure);
+        }
+        observations.put(query, observation);
     }
 
     long now() { return timing.now(); }
@@ -468,7 +487,8 @@ final class NativeVmCapture {
                     || expected.emittable() != patternGrid.getCraftingService().canEmitFor(expected.templates[0].what()))
                 throw new NativeVm.Changed("input selection changed");
         });
-        for (var entry : observations.entrySet()) if (demandedPatterns.contains(entry.getKey().slot().id())
+        for (var entry : observations.entrySet()) if (consultedQueries.contains(entry.getKey())
+                && demandedPatterns.contains(entry.getKey().slot().id())
                 && !sharedNativePatterns.contains(entry.getKey().slot().id())) checks.add(() -> {
             var slot = entry.getKey().slot();
             var actual = patterns.get(slot.id()).pattern().getInputs()[slot.index()];
@@ -565,5 +585,7 @@ final class NativeVmCapture {
     private record Captured(IPatternDetails pattern, Shape shape, AEItemKey definition) { }
     private record Slot(String id, int index) { }
     private record Query(Slot slot, AEKey key) { }
-    private record Observation(boolean valid, AEKey remainder) { }
+    private record Observation(boolean valid, AEKey remainder, RuntimeException failure) {
+        Observation(boolean valid, AEKey remainder) { this(valid, remainder, null); }
+    }
 }

@@ -179,34 +179,42 @@ final class VmInstructionExecution {
             }
         } else {
             // Use AE2's key index for ordering only; quantities are never stored as long.
-            for (var template : node.input.getPossibleInputs()) {
-                if (remaining.signum() == 0) break;
-                var candidates = state.fuzzy(template.what()).iterator();
-                var unit = BigInteger.valueOf(template.amount());
-                while (remaining.signum() > 0 && candidates.hasNext()) {
-                    // #215: do not allocate or observe a whole fuzzy-family cross product.
-                    var batch = new ArrayList<AEKey>(128);
-                    for (int scanned = 0; scanned < 128 && candidates.hasNext(); scanned++) {
+            var templates = node.input.getPossibleInputs();
+            int nextTemplate = 0;
+            Iterator<? extends Map.Entry<AEKey, ?>> candidates = Collections.emptyIterator();
+            var unit = ONE;
+            while (remaining.signum() > 0 && (candidates.hasNext() || nextTemplate < templates.length)) {
+                // #218: batch across template boundaries, retaining each candidate's own unit and priority.
+                var batch = new ArrayList<Candidate>(128);
+                for (int scanned = 0; scanned < 128; scanned++) {
+                    while (!candidates.hasNext() && nextTemplate < templates.length) {
                         checkpoint();
-                        var key = candidates.next().getKey();
-                        if (optimizedGuards && state.amount(key).compareTo(unit) < 0) {
-                            // A later return can replenish this key; enclosing replay guards must see the skip.
-                            state.read(key, unit);
-                        } else batch.add(key);
+                        var template = templates[nextTemplate++];
+                        unit = BigInteger.valueOf(template.amount());
+                        candidates = state.fuzzy(template.what()).iterator();
                     }
-                    if (batch.isEmpty()) continue;
-                    if (node.input instanceof PatternCompiler.DetachedInput detached) detached.prepareCandidates(batch);
-                    for (var key : batch) {
-                        if (remaining.signum() == 0) break;
-                        if (!node.input.isValid(key, null)) continue;
-                        var wanted = remaining.multiply(unit);
-                        var available = state.read(key, wanted);
-                        var taken = available.min(wanted).divide(unit);
-                        if (taken.signum() == 0) continue;
-                        state.extract(key, taken.multiply(unit));
-                        remaining = remaining.subtract(taken);
-                        addReturn(node, key, taken, returns);
-                    }
+                    if (!candidates.hasNext()) break;
+                    checkpoint();
+                    var key = candidates.next().getKey();
+                    if (optimizedGuards && state.amount(key).compareTo(unit) < 0) {
+                        // A later return can replenish this key; enclosing replay guards must see the skip.
+                        state.read(key, unit);
+                    } else batch.add(new Candidate(key, unit));
+                }
+                if (batch.isEmpty()) continue;
+                if (node.input instanceof PatternCompiler.DetachedInput detached)
+                    detached.prepareCandidates(batch.stream().map(Candidate::key).toList());
+                for (var candidate : batch) {
+                    if (remaining.signum() == 0) break;
+                    var key = candidate.key();
+                    if (!node.input.isValid(key, null)) continue;
+                    var wanted = remaining.multiply(candidate.unit());
+                    var available = state.read(key, wanted);
+                    var taken = available.min(wanted).divide(candidate.unit());
+                    if (taken.signum() == 0) continue;
+                    state.extract(key, taken.multiply(candidate.unit()));
+                    remaining = remaining.subtract(taken);
+                    addReturn(node, key, taken, returns);
                 }
             }
         }
@@ -517,4 +525,5 @@ final class VmInstructionExecution {
     private record Family(Object type, Object primary) {
         static Family of(AEKey key) { return new Family(key.getType(), key.getPrimaryKey()); }
     }
+    private record Candidate(AEKey key, BigInteger unit) { }
 }

@@ -48,8 +48,14 @@ Input shapes and primary rules are captured first. Other validity/return rules
 are acquired on demand, only for candidates encountered in the VM inventory,
 in server-owned batches of at most 128 checks / two milliseconds (a single
 callback cannot be preempted). Future returned damage states are not enumerated.
-Observed values are retained per request and revalidated before adoption;
-unobserved variants are never assumed equivalent. Cancellation stays latched
+Candidate batches span templates of the current input, preserving template/fuzzy
+priority and each template's unit. They never expand a future return or an unused
+recipe. A 384-single-candidate fixture uses 3 input handoffs instead of 383; this
+does not establish production wall-clock speed. Only consulted observations are
+revalidated before adoption. Speculative callback failures are retained and thrown
+if the VM consults that candidate; cancellation, epoch changes and fatal errors
+remain immediate. Stock-proof and retained-data limits are not deferred.
+Unobserved variants are never assumed equivalent. Cancellation stays latched
 even after a worker clears its interrupt. Actual retained-data safeguards remain.
 
 ## Build and Test
