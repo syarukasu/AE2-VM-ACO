@@ -117,7 +117,7 @@ public final class NativeVm {
                             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
                     ICraftingPlan plan;
                     try (var span = timing.phase(NativeVmTiming.Phase.FINALIZE)) {
-                    plan = capture.callServer(() -> {
+                    plan = capture.callServer(NativeVmTiming.ServerCall.FINALIZE, () -> {
                         if (exact.wide()) {
                             if (extension == null) throw new IllegalStateException("wide VM result requires an exact accounting owner");
                             return extension.wideResult(grid, level, exact);

@@ -72,7 +72,7 @@ final class NativeVmCapture {
         this.timing = timing;
         Start start;
         try (var span = timing.phase(NativeVmTiming.Phase.STOCK)) {
-        start = callServer(() -> {
+        start = callServer(NativeVmTiming.ServerCall.STOCK, () -> {
             var owner = currentPatternGrid();
             var source = requester == null ? null : requester.getActionSource();
             VmAccounting.Stock counts;
@@ -200,7 +200,8 @@ final class NativeVmCapture {
 
     boolean emittable(AEKey key) {
         if (catalog != null && grid == patternGrid) return catalog.emittable(key);
-        return emitters.computeIfAbsent(key, k -> callServer(() -> grid.getCraftingService().canEmitFor(k)));
+        return emitters.computeIfAbsent(key, k -> callServer(NativeVmTiming.ServerCall.EMITTERS,
+                () -> grid.getCraftingService().canEmitFor(k)));
     }
 
     private List<IPatternDetails> candidates(AEKey key) {
@@ -224,7 +225,7 @@ final class NativeVmCapture {
         var primaries = new java.util.ArrayDeque<Query>();
         boolean complete = false;
         while (!complete) {
-            complete = callServer(() -> {
+            complete = callServer(NativeVmTiming.ServerCall.PRODUCERS, () -> {
                 long deadline = timing.now() + 2_000_000L;
                 var current = producers.computeIfAbsent(key,
                         ignored -> List.copyOf(patternGrid.getCraftingService().getCraftingFor(key)));
@@ -324,9 +325,7 @@ final class NativeVmCapture {
             var crafted = selectCrafted(source, shape.templates());
             var input = new FrozenInput(identity, templates, shape.multiplier(),
                     crafted, patternGrid.getCraftingService().canEmitFor(templates[0].what()),
-                    pattern.getClass() == appeng.crafting.pattern.AEProcessingPattern.class
-                            && source.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input")
-                            && templates.length == 1);
+                    nativeExactInput(source, templates.length));
             capturedInputs.put(identity, input);
             slots[slot] = input;
             capturedQueries.add(new Query(identity, templates[0].what()));
@@ -342,6 +341,7 @@ final class NativeVmCapture {
         primaries.addAll(capturedQueries);
         frozen.put(id, value);
         frozenIds.put(value, id);
+        timing.patternType(pattern.getClass().getName());
         return value;
     }
 
@@ -374,6 +374,7 @@ final class NativeVmCapture {
         frozen.put(id, value);
         frozenIds.put(value, id);
         sharedNativePatterns.add(id);
+        timing.patternType(pattern.getClass().getName());
         return value;
     }
 
@@ -404,7 +405,7 @@ final class NativeVmCapture {
     private void prepareQueries(List<Query> queries) {
         for (int start = 0; start < queries.size();) {
             final int first = start;
-            start = callServer(() -> {
+            start = callServer(NativeVmTiming.ServerCall.INPUTS, () -> {
                 long deadline = timing.now() + 2_000_000L;
                 int i = first;
                 do {
@@ -447,7 +448,7 @@ final class NativeVmCapture {
         // AE2/exact execution must reserve against current storage at submission.
         List<Runnable> checks = new ArrayList<>();
         // #218: unchanged registered native patterns are immutable; dynamic callbacks are not.
-        if (catalog != null) callServer(() -> null);
+        if (catalog != null) callServer(NativeVmTiming.ServerCall.VALIDATE, () -> null);
         for (var entry : producers.entrySet()) if (demandedKeys.contains(entry.getKey())
                 && (catalog == null || entry.getValue().stream().anyMatch(pattern -> catalog.nativePattern(pattern) == null))) checks.add(() -> {
             if (!entry.getValue().equals(List.copyOf(patternGrid.getCraftingService().getCraftingFor(entry.getKey()))))
@@ -462,7 +463,8 @@ final class NativeVmCapture {
                 && !sharedNativePatterns.contains(entry.getKey().id())) checks.add(() -> {
             var actual = patterns.get(entry.getKey().id()).pattern().getInputs()[entry.getKey().index()];
             var expected = entry.getValue();
-            if (!Objects.equals(expected.craftedKey(), selectCrafted(actual, List.of(expected.templates)))
+            if ((expected.nativeExact && !nativeExactInput(actual, actual.getPossibleInputs().length))
+                    || !Objects.equals(expected.craftedKey(), selectCrafted(actual, List.of(expected.templates)))
                     || expected.emittable() != patternGrid.getCraftingService().canEmitFor(expected.templates[0].what()))
                 throw new NativeVm.Changed("input selection changed");
         });
@@ -477,7 +479,7 @@ final class NativeVmCapture {
         });
         for (int start = 0; start < checks.size();) {
             final int first = start;
-            start = callServer(() -> {
+            start = callServer(NativeVmTiming.ServerCall.VALIDATE, () -> {
                 long deadline = timing.now() + 2_000_000L;
                 int index = first;
                 do { checks.get(index++).run(); }
@@ -504,8 +506,9 @@ final class NativeVmCapture {
         return total.values().stream().anyMatch(value -> value.bitLength() > 63);
     }
 
-    <T> T callServer(Supplier<T> action) { return callServer(action, true); }
-    private <T> T callServer(Supplier<T> action, boolean validateEpoch) {
+    <T> T callServer(Supplier<T> action) { return callServer(NativeVmTiming.ServerCall.OTHER, action); }
+    <T> T callServer(NativeVmTiming.ServerCall kind, Supplier<T> action) { return callServer(kind, action, true); }
+    private <T> T callServer(NativeVmTiming.ServerCall kind, Supplier<T> action, boolean validateEpoch) {
         var server = Objects.requireNonNull(level.getServer());
         Supplier<T> checked = () -> {
             if (cancelled || worker.isInterrupted() || server.isStopped()) throw new CancellationException("VM cancelled");
@@ -520,7 +523,7 @@ final class NativeVmCapture {
         var future = server.submit(() -> {
             long started = timing.now();
             try { return checked.get(); }
-            finally { timing.serverFinished(submitted, started, timing.now()); }
+            finally { timing.serverFinished(kind, submitted, started, timing.now()); }
         });
         try { return future.get(); }
         catch (InterruptedException interrupted) {
@@ -546,6 +549,10 @@ final class NativeVmCapture {
         if (outputs.isEmpty() || outputs.stream().anyMatch(s -> s.amount() <= 0))
             throw new IllegalArgumentException("invalid native pattern output");
         return new Shape(List.copyOf(inputs), outputs);
+    }
+
+    private static boolean nativeExactInput(IPatternDetails.IInput input, int templates) {
+        return templates == 1 && input.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input");
     }
 
     private static void bounded(int count) {

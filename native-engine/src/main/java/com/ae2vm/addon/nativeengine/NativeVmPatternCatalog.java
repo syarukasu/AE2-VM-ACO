@@ -51,15 +51,15 @@ final class NativeVmPatternCatalog {
 
     static NativeVmPatternCatalog build(IGrid grid, MinecraftServer server, long epoch, long recipes,
             NativeVmCapture capture) {
-        var keys = capture.callServer(() -> {
+        var keys = capture.callServer(NativeVmTiming.ServerCall.CATALOG, () -> {
             var available = grid.getCraftingService().getCraftables(key -> true);
             return available.size() > MAX_ENTRIES ? null : List.copyOf(available);
         });
         if (keys == null) return null;
         var builder = new Builder(keys);
-        while (!capture.callServer(() -> builder.advance(grid, capture))) { }
+        while (!capture.callServer(NativeVmTiming.ServerCall.CATALOG, () -> builder.advance(grid, capture))) { }
         if (builder.oversized) return null;
-        return capture.callServer(() -> {
+        return capture.callServer(NativeVmTiming.ServerCall.CATALOG, () -> {
             var result = new NativeVmPatternCatalog(builder);
             publish(grid, server, epoch, recipes, result);
             return result;

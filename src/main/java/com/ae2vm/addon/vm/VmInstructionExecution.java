@@ -186,7 +186,15 @@ final class VmInstructionExecution {
                 while (remaining.signum() > 0 && candidates.hasNext()) {
                     // #215: do not allocate or observe a whole fuzzy-family cross product.
                     var batch = new ArrayList<AEKey>(128);
-                    while (batch.size() < 128 && candidates.hasNext()) batch.add(candidates.next().getKey());
+                    for (int scanned = 0; scanned < 128 && candidates.hasNext(); scanned++) {
+                        checkpoint();
+                        var key = candidates.next().getKey();
+                        if (optimizedGuards && state.amount(key).compareTo(unit) < 0) {
+                            // A later return can replenish this key; enclosing replay guards must see the skip.
+                            state.read(key, unit);
+                        } else batch.add(key);
+                    }
+                    if (batch.isEmpty()) continue;
                     if (node.input instanceof PatternCompiler.DetachedInput detached) detached.prepareCandidates(batch);
                     for (var key : batch) {
                         if (remaining.signum() == 0) break;
@@ -220,8 +228,9 @@ final class VmInstructionExecution {
                 }
                 return;
             }
-            var window = new Trace(state);
-            traces.add(window);
+            // A one-shot process cannot replay; enclosing traces still observe reads and failed trials.
+            var window = !optimizedGuards || demand.compareTo(output) > 0 ? new Trace(state) : null;
+            if (window != null) traces.add(window);
             var windowOutput = ZERO;
             int iterations = 0, windowSize = 64;
             try {
@@ -247,6 +256,7 @@ final class VmInstructionExecution {
                     else state.adopt(target);
                 }
                 demand = demand.subtract(taken);
+                if (window == null) continue;
                 windowOutput = windowOutput.add(taken);
                 // A multi-instruction period also covers changing tool damage and returned variants.
                 var repeats = ZERO;
@@ -276,7 +286,9 @@ final class VmInstructionExecution {
                     windowSize = Math.min(1_048_576, windowSize * 2);
                 }
             }
-            } finally { window.finish(state); traces.remove(traces.size() - 1); }
+            } finally {
+                if (window != null) { window.finish(state); traces.remove(traces.size() - 1); }
+            }
             if (demand.signum() == 0) return;
         }
         if (!simulate) throw new Missing();
