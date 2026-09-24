@@ -21,6 +21,7 @@ public final class CraftingVM {
     private LongConsumer progress = ignored -> { };
     private volatile boolean executing;
     private long instructions, work;
+    private long stateCopies, branchTrials, branchEntries;
     private BigInteger skipped = BigInteger.ZERO;
 
     public CraftingVM(Object networkKey, Function<AEKey, IPatternDetails> patternResolver) {
@@ -33,6 +34,9 @@ public final class CraftingVM {
     public boolean isExecuting() { return executing; }
     public long instructions() { return instructions; }
     public long work() { return work; }
+    public long stateCopies() { return stateCopies; }
+    public long branchTrials() { return branchTrials; }
+    public long branchEntries() { return branchEntries; }
     public BigInteger skippedIterations() { return skipped; }
 
     public VmCraftingPlan execute(CraftingBytecode request, VmSimulationState simulation) {
@@ -53,6 +57,9 @@ public final class CraftingVM {
         } finally {
             instructions = interpreter.instructions();
             work = interpreter.work();
+            stateCopies = interpreter.stateCopies();
+            branchTrials = interpreter.branchTrials();
+            branchEntries = interpreter.branchEntries();
             skipped = interpreter.skippedIterations();
             executing = false;
         }

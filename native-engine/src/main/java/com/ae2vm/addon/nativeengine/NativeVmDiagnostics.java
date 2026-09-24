@@ -42,6 +42,10 @@ final class NativeVmDiagnostics {
 
     synchronized void completed(long order, Object output, Object requested, long elapsedMillis,
             boolean simulation) {
+        completed(order, output, requested, elapsedMillis, simulation, "");
+    }
+    synchronized void completed(long order, Object output, Object requested, long elapsedMillis,
+            boolean simulation, String timing) {
         completed++;
         if (simulation) missing++;
         totalMillis += elapsedMillis;
@@ -51,8 +55,8 @@ final class NativeVmDiagnostics {
             long now = clock.getAsLong();
             if (now - lastSlow >= DETAIL_INTERVAL) {
                 lastSlow = now;
-                log.warn("AE2-VM event=slow_calculation route=vm-native order={} output={} requested={} simulation={} elapsedMs={}",
-                        order, output, requested, simulation, elapsedMillis);
+                log.warn("AE2-VM event=slow_calculation route=vm-native order={} output={} requested={} simulation={} elapsedMs={} {}",
+                        order, output, requested, simulation, elapsedMillis, timing);
             }
         }
         summarize();

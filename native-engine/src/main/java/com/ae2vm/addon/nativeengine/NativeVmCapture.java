@@ -42,14 +42,21 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     private final Map<Slot, Input<AEKey>> inputs = new LinkedHashMap<>();
     private final Map<Query, Observation<AEKey>> observations = new LinkedHashMap<>();
     private final java.util.function.LongConsumer progress;
+    private final NativeVmTiming timing;
 
     NativeVmCapture(IGrid grid, Level level, VmAccounting accounting) {
         this(grid, level, accounting, ignored -> { });
     }
     NativeVmCapture(IGrid grid, Level level, VmAccounting accounting, java.util.function.LongConsumer progress) {
+        this(grid, level, accounting, progress, new NativeVmTiming());
+    }
+    NativeVmCapture(IGrid grid, Level level, VmAccounting accounting, java.util.function.LongConsumer progress,
+            NativeVmTiming timing) {
         this.grid = grid;
         this.level = level;
         this.progress = progress;
+        this.timing = timing;
+        try (var span = timing.phase(NativeVmTiming.Phase.STOCK)) {
         var start = callServer(() -> {
             var counts = accounting == null
                     ? ordinaryStock(grid.getStorageService().getInventory().getAvailableStacks())
@@ -60,6 +67,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
         recipeEpoch = start.recipes();
         stock = start.stock();
         stock.amounts().keySet().forEach(stockKeys::add);
+        }
     }
 
     private static VmAccounting.Stock ordinaryStock(KeyCounter values) {
@@ -75,6 +83,10 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
 
     /** Compile and run the upstream VM, never the rc.4 branch interpreter. */
     VmQuantities plan(AEKey root, BigInteger requested, boolean craftLess) {
+        Map<String, FrozenPattern> frozen = new LinkedHashMap<>();
+        Map<IPatternDetails, String> ids = new IdentityHashMap<>();
+        Map<AEKey, List<IPatternDetails>> byOutput = new LinkedHashMap<>();
+        try (var span = timing.phase(NativeVmTiming.Phase.PREPARE)) {
         var queue = new java.util.ArrayDeque<AEKey>();
         var seen = new java.util.LinkedHashSet<AEKey>();
         queue.add(root); seen.add(root);
@@ -98,7 +110,6 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             }
             return null;
         });
-        Map<String, FrozenPattern> frozen = new LinkedHashMap<>();
         var primaries = new java.util.LinkedHashSet<Query>();
         // #215: capture structural inputs, never enumerate the closure of future returns.
         for (var entry : patterns.entrySet()) {
@@ -118,13 +129,14 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
                     slots, shape.outputs().toArray(GenericStack[]::new)));
         }
         prepareQueries(new ArrayList<>(primaries));
-        Map<IPatternDetails, String> ids = new IdentityHashMap<>();
         frozen.forEach((id, pattern) -> ids.put(pattern, id));
-        Map<AEKey, List<IPatternDetails>> byOutput = new LinkedHashMap<>();
         programs.forEach((key, codes) -> byOutput.put(key, codes.stream()
                 .map(code -> (IPatternDetails) frozen.get(code.id())).toList()));
+        }
         try (var scope = PatternCompiler.openScope()) {
+            try (var span = timing.phase(NativeVmTiming.Phase.PREPARE)) {
             frozen.values().forEach(PatternCompiler::compileIfAbsent);
+            }
             var vm = new CraftingVM(this, key -> {
                 var choices = byOutput.getOrDefault(key, List.of());
                 return choices.isEmpty() ? null : choices.get(0);
@@ -132,7 +144,12 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             vm.setAllPatternsResolver(key -> byOutput.getOrDefault(key, List.of()));
             vm.setEmitterResolver(key -> Boolean.TRUE.equals(emitters.get(key)));
             vm.setProgressListener(progress);
-            var result = vm.execute(PatternCompiler.compileRequest(root, requested), new VmSimulationState(stock.amounts()), craftLess);
+            com.ae2vm.addon.vm.VmCraftingPlan result;
+            try (var span = timing.phase(NativeVmTiming.Phase.VM)) {
+                try {
+                    result = vm.execute(PatternCompiler.compileRequest(root, requested), new VmSimulationState(stock.amounts()), craftLess);
+                } finally { timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries()); }
+            }
             Map<String, BigInteger> crafts = new LinkedHashMap<>();
             result.patternTimes().forEach((pattern, count) -> crafts.merge(ids.get(pattern), count, BigInteger::add));
             return new VmQuantities(root, result.finalOutput().amount(), crafts,
@@ -280,6 +297,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     }
 
     void validate() {
+        try (var span = timing.phase(NativeVmTiming.Phase.VALIDATE)) {
         // Stock is intentionally NOT compared: the result describes its snapshot;
         // AE2/exact execution must reserve against current storage at submission.
         List<Runnable> checks = new ArrayList<>();
@@ -315,6 +333,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
                 return index;
             });
         }
+        }
     }
 
     Map<String, IPatternDetails> bindings() {
@@ -344,7 +363,13 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             return action.get();
         };
         if (server.isSameThread()) return checked.get();
-        var future = server.submit(checked);
+        long submitted = timing.now();
+        try {
+        var future = server.submit(() -> {
+            long started = timing.now();
+            try { return checked.get(); }
+            finally { timing.serverFinished(submitted, started, timing.now()); }
+        });
         try { return future.get(); }
         catch (InterruptedException interrupted) {
             cancelled = true;
@@ -354,6 +379,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             if (failed.getCause() instanceof Error fatal) throw fatal;
             throw new IllegalStateException(failed.getCause());
         }
+        } finally { timing.unblocked(submitted); }
     }
 
     private static Shape shape(IPatternDetails pattern) {

@@ -31,6 +31,8 @@ final class VmInstructionExecution {
     private long instructions;
     private long work;
     private long stateCopies;
+    private long branchTrials, branchEntries;
+    private final boolean sparseBranches, optimizedGuards;
     private long stockKeyScans, minimumSnapshots, replays;
     private BigInteger skipped = ZERO;
     private final java.util.function.LongConsumer progress;
@@ -39,6 +41,13 @@ final class VmInstructionExecution {
     VmInstructionExecution(CraftingBytecode request, VmSimulationState inventory,
             Function<AEKey, List<IPatternDetails>> resolver, Predicate<AEKey> emitters,
             java.util.function.LongConsumer progress) {
+        this(request, inventory, resolver, emitters, progress, true, true);
+    }
+    VmInstructionExecution(CraftingBytecode request, VmSimulationState inventory,
+            Function<AEKey, List<IPatternDetails>> resolver, Predicate<AEKey> emitters,
+            java.util.function.LongConsumer progress, boolean sparseBranches, boolean optimizedGuards) {
+        this.sparseBranches = sparseBranches;
+        this.optimizedGuards = optimizedGuards;
         this.resolver = resolver;
         this.emitters = emitters;
         this.progress = progress;
@@ -50,6 +59,8 @@ final class VmInstructionExecution {
     long instructions() { return instructions; }
     long work() { return work; }
     long stateCopies() { return stateCopies; }
+    long branchTrials() { return branchTrials; }
+    long branchEntries() { return branchEntries; }
     long stockKeyScans() { return stockKeyScans; }
     long minimumSnapshots() { return minimumSnapshots; }
     long replays() { return replays; }
@@ -208,7 +219,8 @@ final class VmInstructionExecution {
             while (demand.signum() > 0) {
                 checkpoint();
                 boolean transaction = choices.size() > 1;
-                var target = transaction ? state.copy() : state;
+                if (transaction) branchTrials++;
+                var target = !transaction ? state : sparseBranches ? new State(state) : state.copy();
                 var times = transaction || process.single ? ONE : PatternCompiler.ceilDiv(demand, output);
                 BigInteger taken;
                 try {
@@ -218,19 +230,30 @@ final class VmInstructionExecution {
                 } catch (Missing failure) {
                     if (!transaction) throw failure;
                     break;
+                } finally {
+                    if (transaction) branchEntries += sparseBranches ? target.changedEntries() : state.entries();
                 }
-                if (transaction) state.adopt(target);
+                if (transaction) {
+                    if (sparseBranches) target.commitTo(state);
+                    else state.adopt(target);
+                }
                 demand = demand.subtract(taken);
                 windowOutput = windowOutput.add(taken);
                 // A multi-instruction period also covers changing tool damage and returned variants.
                 var repeats = ZERO;
-                boolean sameKeys = window.before.sameStockKeys(state);
+                boolean sameKeys;
+                if (optimizedGuards) sameKeys = window.before.sameStockKeys(state);
+                else {
+                    stockKeyScans++;
+                    sameKeys = window.before.stock.keySet().equals(state.stock.keySet());
+                    window.captureMinimum(state);
+                }
                 traces.remove(traces.size() - 1);
                 try {
                     if (sameKeys && demand.compareTo(windowOutput) >= 0) {
                         repeats = window.safeRepeats(state, demand.divide(windowOutput));
                         if (repeats.signum() > 0) {
-                            window.captureMinimum(state);
+                            if (optimizedGuards) window.captureMinimum(state);
                             window.replay(state, repeats);
                         }
                     }
@@ -299,14 +322,41 @@ final class VmInstructionExecution {
     }
 
     private final class State {
-        final Map<AEKey, BigInteger> stock = new LinkedHashMap<>(), used = new LinkedHashMap<>(),
-                emitted = new LinkedHashMap<>(), missing = new LinkedHashMap<>();
-        final Map<IPatternDetails, BigInteger> patterns = new LinkedHashMap<>();
+        final Map<AEKey, BigInteger> stock, used, emitted, missing;
+        final Map<IPatternDetails, BigInteger> patterns;
         final Map<Trace, Map<AEKey, BigInteger>> lows = new IdentityHashMap<>();
-        final Map<Family, KeyCounter> keys = new HashMap<>();
+        final Map<Family, KeyCounter> keys;
         private Object stockKeyVersion = EMPTY_STOCK_KEYS;
         VmByteCost bytes = VmByteCost.ZERO;
+        State() {
+            stock = new LinkedHashMap<>(); used = new LinkedHashMap<>(); emitted = new LinkedHashMap<>();
+            missing = new LinkedHashMap<>(); patterns = new LinkedHashMap<>(); keys = new HashMap<>();
+        }
+        State(State parent) {
+            stock = new VmBranchMap<>(parent.stock); used = new VmBranchMap<>(parent.used);
+            emitted = new VmBranchMap<>(parent.emitted); missing = new VmBranchMap<>(parent.missing);
+            patterns = new VmBranchMap<>(parent.patterns); keys = new VmBranchMap<>(parent.keys);
+            parent.lows.forEach((trace, low) -> lows.put(trace, new VmBranchMap<>(low)));
+            stockKeyVersion = parent.stockKeyVersion; bytes = parent.bytes;
+        }
+        long changedEntries() {
+            long count = 0;
+            for (var map : List.of(stock, used, emitted, missing, patterns, keys))
+                count += ((VmBranchMap<?, ?>) map).changedEntries();
+            for (var map : lows.values()) count += ((VmBranchMap<?, ?>) map).changedEntries();
+            return count;
+        }
+        void commitTo(State parent) {
+            for (var map : List.of(stock, used, emitted, missing, patterns, keys)) ((VmBranchMap<?, ?>) map).commit();
+            // Child traces have finished; only inherited low-water maps survive here.
+            for (var map : lows.values()) ((VmBranchMap<?, ?>) map).commit();
+            parent.stockKeyVersion = stockKeyVersion; parent.bytes = bytes;
+        }
         State copy() { stateCopies++; var copy = new State(); copy.adopt(this); return copy; }
+        long entries() {
+            return (long) stock.size() + used.size() + emitted.size() + missing.size() + patterns.size()
+                    + keys.size() + lows.values().stream().mapToLong(Map::size).sum();
+        }
         void adopt(State other) {
             replace(stock, other.stock); replace(used, other.used); replace(emitted, other.emitted);
             replace(missing, other.missing); replace(patterns, other.patterns);

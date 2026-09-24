@@ -46,7 +46,12 @@ public final class NativeVm {
     private static volatile VmAccounting accounting;
     private NativeVm() { }
 
-    public record CalculationSample(long order, String output, BigInteger requested, long elapsedMillis, String status) { }
+    public record CalculationSample(long order, String output, BigInteger requested, long elapsedMillis, String status,
+            String timing) {
+        public CalculationSample(long order, String output, BigInteger requested, long elapsedMillis, String status) {
+            this(order, output, requested, elapsedMillis, status, "");
+        }
+    }
 
     /** Bounded diagnostics only; never a cache of plans or world references. */
     public static java.util.List<CalculationSample> recentCalculations() { return DIAGNOSTICS.recent(); }
@@ -84,6 +89,7 @@ public final class NativeVm {
     private static ICraftingPlan compute(long order, IGrid grid, Level level, AEKey output,
             BigInteger request, CalculationStrategy strategy) {
         long started = System.nanoTime();
+        var timing = new NativeVmTiming();
         DIAGNOSTICS.started();
         if (DIAGNOSTICS.verbose())
             LOG.debug("AE2-VM event=started order={} output={} requested={} owner=vm-native", order, output.getId(), request);
@@ -92,7 +98,7 @@ public final class NativeVm {
                 try {
                     VmAccounting extension = accounting;
                     var capture = new NativeVmCapture(grid, level, extension, work -> DIAGNOSTICS.running(
-                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)));
+                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)), timing);
                     var result = capture.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS);
                     var bindings = capture.bindings();
                     BigInteger bytes = bytes(result);
@@ -105,17 +111,21 @@ public final class NativeVm {
                     if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantities_ready order={} patterns={} usedKeys={} missingKeys={} wide={} elapsedMs={}",
                             order, result.crafts().size(), result.used().size(), result.missing().size(), exact.wide(),
                             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-                    ICraftingPlan plan = capture.callServer(() -> {
+                    ICraftingPlan plan;
+                    try (var span = timing.phase(NativeVmTiming.Phase.FINALIZE)) {
+                    plan = capture.callServer(() -> {
                         if (exact.wide()) {
                             if (extension == null) throw new IllegalStateException("wide VM result requires an exact accounting owner");
                             return extension.wideResult(grid, level, exact);
                         }
                         return ordinaryPlan(exact);
                     });
+                    }
+                    String profile = timing.summary();
                     DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation() ? "missing" : "ready"));
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation() ? "missing" : "ready", profile));
                     DIAGNOSTICS.completed(order, output.getId(), request,
-                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation());
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation(), profile);
                     if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} output={} requested={} "
                                     + "instructions={} work={} skipped={} simulation={} elapsedMs={}",
                             order, output.getId(), result.requested(), result.instructions(), result.work(),
@@ -133,13 +143,13 @@ public final class NativeVm {
             }
         } catch (CancellationException cancelled) {
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "cancelled"));
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "cancelled", timing.summary()));
             DIAGNOSTICS.cancelled();
             if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=cancelled order={}", order);
             throw cancelled;
         } catch (RuntimeException failure) {
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "failed"));
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "failed", timing.summary()));
             DIAGNOSTICS.failed(order, output.getId(), request, failure);
             throw failure;
         }
