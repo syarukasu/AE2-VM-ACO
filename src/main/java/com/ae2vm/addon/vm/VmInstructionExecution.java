@@ -19,6 +19,7 @@ import java.util.function.Predicate;
  */
 final class VmInstructionExecution {
     private static final BigInteger ZERO = BigInteger.ZERO, ONE = BigInteger.ONE;
+    private static final Object EMPTY_STOCK_KEYS = new Object();
     private final Function<AEKey, List<IPatternDetails>> resolver;
     private final Predicate<AEKey> emitters;
     private final Map<AEKey, BigInteger> initial;
@@ -30,6 +31,7 @@ final class VmInstructionExecution {
     private long instructions;
     private long work;
     private long stateCopies;
+    private long stockKeyScans, minimumSnapshots, replays;
     private BigInteger skipped = ZERO;
     private final java.util.function.LongConsumer progress;
     private final List<Trace> traces = new ArrayList<>();
@@ -48,6 +50,9 @@ final class VmInstructionExecution {
     long instructions() { return instructions; }
     long work() { return work; }
     long stateCopies() { return stateCopies; }
+    long stockKeyScans() { return stockKeyScans; }
+    long minimumSnapshots() { return minimumSnapshots; }
+    long replays() { return replays; }
     BigInteger skippedIterations() { return skipped; }
 
     VmCraftingPlan execute(BigInteger amount, boolean craftLess) {
@@ -219,16 +224,19 @@ final class VmInstructionExecution {
                 windowOutput = windowOutput.add(taken);
                 // A multi-instruction period also covers changing tool damage and returned variants.
                 var repeats = ZERO;
+                boolean sameKeys = window.before.sameStockKeys(state);
                 traces.remove(traces.size() - 1);
                 try {
-                    window.minimum = new LinkedHashMap<>(state.lows.get(window));
-                    if (demand.compareTo(windowOutput) >= 0) {
+                    if (sameKeys && demand.compareTo(windowOutput) >= 0) {
                         repeats = window.safeRepeats(state, demand.divide(windowOutput));
-                        if (repeats.signum() > 0) window.replay(state, repeats);
+                        if (repeats.signum() > 0) {
+                            window.captureMinimum(state);
+                            window.replay(state, repeats);
+                        }
                     }
                 } finally { traces.add(window); }
                 demand = demand.subtract(windowOutput.multiply(repeats));
-                if (repeats.signum() > 0 || !window.before.stock.keySet().equals(state.stock.keySet())
+                if (repeats.signum() > 0 || !sameKeys
                         || ++iterations >= windowSize) {
                     window.finish(state); traces.remove(traces.size() - 1);
                     window = new Trace(state); traces.add(window);
@@ -296,15 +304,29 @@ final class VmInstructionExecution {
         final Map<IPatternDetails, BigInteger> patterns = new LinkedHashMap<>();
         final Map<Trace, Map<AEKey, BigInteger>> lows = new IdentityHashMap<>();
         final Map<Family, KeyCounter> keys = new HashMap<>();
+        private Object stockKeyVersion = EMPTY_STOCK_KEYS;
         VmByteCost bytes = VmByteCost.ZERO;
         State copy() { stateCopies++; var copy = new State(); copy.adopt(this); return copy; }
         void adopt(State other) {
             replace(stock, other.stock); replace(used, other.used); replace(emitted, other.emitted);
             replace(missing, other.missing); replace(patterns, other.patterns);
+            stockKeyVersion = other.stockKeyVersion;
             lows.clear(); other.lows.forEach((trace, low) -> lows.put(trace, new LinkedHashMap<>(low)));
             keys.clear(); keys.putAll(other.keys); bytes = other.bytes;
         }
         BigInteger amount(AEKey key) { return stock.getOrDefault(key, initial.getOrDefault(key, ZERO)); }
+        boolean sameStockKeys(State other) {
+            // #217: identity proves membership equality, not quantity equality. Branches inherit, never increment, tokens.
+            if (stockKeyVersion == other.stockKeyVersion) return true;
+            if (stock.size() != other.stock.size()) return false;
+            stockKeyScans++;
+            if (!stock.keySet().equals(other.stock.keySet())) return false;
+            stockKeyVersion = other.stockKeyVersion;
+            return true;
+        }
+        private void putStock(AEKey key, BigInteger amount) {
+            if (stock.put(key, amount) == null) stockKeyVersion = new Object();
+        }
         Collection<? extends Map.Entry<AEKey, ?>> fuzzy(AEKey key) {
             return keys.getOrDefault(Family.of(key), initialKeys).findFuzzy(key, FuzzyMode.IGNORE_ALL);
         }
@@ -319,7 +341,7 @@ final class VmInstructionExecution {
         }
         BigInteger read(AEKey key, BigInteger requested) {
             var available = amount(key);
-            stock.putIfAbsent(key, available);
+            if (stock.putIfAbsent(key, available) == null) stockKeyVersion = new Object();
             index(key);
             for (var trace : traces) trace.read(key, available, requested, this);
             return available;
@@ -327,13 +349,13 @@ final class VmInstructionExecution {
         BigInteger extract(AEKey key, BigInteger requested) {
             var taken = read(key, requested).min(requested);
             var left = amount(key).subtract(taken);
-            stock.put(key, left); index(key);
+            putStock(key, left); index(key);
             lows.values().forEach(low -> low.merge(key, left, BigInteger::min));
             var required = initial.getOrDefault(key, ZERO).subtract(left);
             if (required.signum() > 0) used.merge(key, required, BigInteger::max);
             return taken;
         }
-        void insert(AEKey key, BigInteger quantity) { stock.put(key, amount(key).add(quantity)); index(key); }
+        void insert(AEKey key, BigInteger quantity) { putStock(key, amount(key).add(quantity)); index(key); }
         void charge(AEKey key, BigInteger amount) {
             bytes = bytes.add(new VmByteCost(amount.multiply(BigInteger.valueOf(8)), BigInteger.valueOf(key.getType().getAmountPerByte())));
         }
@@ -349,6 +371,10 @@ final class VmInstructionExecution {
             state.lows.put(this, new LinkedHashMap<>(state.stock));
         }
         void finish(State state) { minimum = state.lows.remove(this); }
+        void captureMinimum(State state) {
+            minimumSnapshots++;
+            minimum = new LinkedHashMap<>(state.lows.get(this));
+        }
         void read(AEKey key, BigInteger available, BigInteger requested, State current) {
             var start = before.amount(key);
             var offset = available.subtract(start);
@@ -360,8 +386,7 @@ final class VmInstructionExecution {
             }
         }
         BigInteger safeRepeats(State after, BigInteger limit) {
-            // New fuzzy members can change iteration order. Re-observe once before replay.
-            if (!before.stock.keySet().equals(after.stock.keySet())) return ZERO;
+            // The caller already verified the key domain; numerical guards still apply to every observed input.
             for (var key : lower.keySet()) {
                 var start = before.amount(key);
                 var delta = after.amount(key).subtract(start);
@@ -373,6 +398,7 @@ final class VmInstructionExecution {
             return limit.max(ZERO);
         }
         void replay(State state, BigInteger repeats) {
+            replays++;
             skipped = skipped.add(repeats);
             var after = state.copy();
             // Extend enclosing guards across every skipped iteration, including failed trials.
@@ -388,7 +414,7 @@ final class VmInstructionExecution {
             }
             for (var key : after.stock.keySet()) {
                 var delta = after.amount(key).subtract(before.amount(key));
-                state.stock.put(key, after.stock.get(key).add(delta.multiply(repeats)));
+                state.putStock(key, after.stock.get(key).add(delta.multiply(repeats)));
                 var low = minimum.getOrDefault(key, before.amount(key));
                 if (delta.signum() < 0) low = low.add(delta.multiply(repeats));
                 var peak = initial.getOrDefault(key, ZERO).subtract(low);
