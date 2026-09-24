@@ -35,4 +35,11 @@ public abstract class NativeCraftingServiceMixin implements com.ae2vm.addon.nati
         if (node.getService(appeng.api.networking.crafting.ICraftingProvider.class) != null)
             NativeVm.patternsChanged(grid);
     }
+
+    @Inject(method = "addNode", at = @At("TAIL"), require = 1)
+    private void vm$added(appeng.api.networking.IGridNode node, net.minecraft.nbt.CompoundTag savedData, CallbackInfo ci) {
+        // #218: initial provider registration also invalidates cached missing producers.
+        if (node.getService(appeng.api.networking.crafting.ICraftingProvider.class) != null)
+            NativeVm.patternsChanged(grid);
+    }
 }

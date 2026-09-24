@@ -63,11 +63,15 @@ public final class NativeVm {
 
     public static long epoch(IGrid grid) { return EPOCHS.getOrDefault(grid, 0L); }
     public static long recipeEpoch() { return RECIPES.get(); }
-    public static void recipesChanged() { RECIPES.incrementAndGet(); }
-    public static void patternsChanged(IGrid grid) { EPOCHS.merge(grid, 1L, Long::sum); }
+    public static void recipesChanged() { RECIPES.incrementAndGet(); NativeVmPatternCatalog.recipesChanged(); }
+    public static void patternsChanged(IGrid grid) {
+        EPOCHS.merge(grid, 1L, Long::sum);
+        NativeVmPatternCatalog.invalidate(grid);
+    }
     public static void cancelServer(MinecraftServer server) {
         ACTIVE.forEach((future, owner) -> { if (owner == server) future.cancel(true); });
         WORKERS.purge();
+        NativeVmPatternCatalog.stop(server);
     }
 
     public static Future<ICraftingPlan> calculate(IGrid grid, Level level,

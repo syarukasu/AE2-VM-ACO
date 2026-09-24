@@ -35,6 +35,8 @@ final class NativeVmCapture {
     private final long epoch;
     private final long recipeEpoch;
     private final VmAccounting.Stock stock;
+    private final NativeVmPatternCatalog catalog;
+    private final Set<String> sharedNativePatterns = new LinkedHashSet<>();
     private final Map<AEKey, List<IPatternDetails>> programs = new LinkedHashMap<>();
     private final Map<AEKey, List<IPatternDetails>> producers = new LinkedHashMap<>();
     private final Map<AEKey, Boolean> emitters = new LinkedHashMap<>();
@@ -68,8 +70,9 @@ final class NativeVmCapture {
         this.level = level;
         this.progress = progress;
         this.timing = timing;
+        Start start;
         try (var span = timing.phase(NativeVmTiming.Phase.STOCK)) {
-        var start = callServer(() -> {
+        start = callServer(() -> {
             var owner = currentPatternGrid();
             var source = requester == null ? null : requester.getActionSource();
             VmAccounting.Stock counts;
@@ -85,12 +88,21 @@ final class NativeVmCapture {
                 counts = requester == null ? ordinary.exactStock(grid) : ordinary.requestStock(grid, source, simulatedExtraction());
             } else counts = requester == null ? accounting.exactStock(grid)
                     : accounting.requestStock(grid, source, simulatedExtraction());
-            return new Start(owner, owner == null ? 0 : NativeVm.epoch(owner), NativeVm.recipeEpoch(), counts);
+            long version = owner == null ? 0 : NativeVm.epoch(owner);
+            long recipes = NativeVm.recipeEpoch();
+            boolean shared = owner != null && owner.getCraftingService() instanceof NativeVmHook;
+            var ready = shared ? NativeVmPatternCatalog.cached(owner, level.getServer(), version, recipes) : null;
+            return new Start(owner, version, recipes, counts, shared, ready);
         }, false);
+        }
         patternGrid = start.patternGrid();
         epoch = start.epoch();
         recipeEpoch = start.recipes();
         stock = start.stock();
+        try (var span = timing.phase(NativeVmTiming.Phase.PREPARE)) {
+        catalog = start.shared() && start.catalog() == null
+                ? NativeVmPatternCatalog.build(patternGrid, level.getServer(), epoch, recipeEpoch, this)
+                : start.catalog();
         }
     }
 
@@ -187,6 +199,7 @@ final class NativeVmCapture {
     }
 
     boolean emittable(AEKey key) {
+        if (catalog != null && grid == patternGrid) return catalog.emittable(key);
         return emitters.computeIfAbsent(key, k -> callServer(() -> grid.getCraftingService().canEmitFor(k)));
     }
 
@@ -196,6 +209,17 @@ final class NativeVmCapture {
         var cached = programs.get(key);
         if (cached != null) return demand(key, cached);
         bounded(programs.size());
+        if (catalog != null) {
+            var choices = catalog.producers(key);
+            if (choices.stream().allMatch(pattern -> catalog.nativePattern(pattern) != null)) {
+                var values = new ArrayList<IPatternDetails>();
+                for (var pattern : choices) values.add(freezeNative(pattern, catalog.nativePattern(pattern)));
+                var value = List.copyOf(values);
+                producers.put(key, choices);
+                programs.put(key, value);
+                return demand(key, value);
+            }
+        }
         var result = new ArrayList<IPatternDetails>();
         var primaries = new java.util.ArrayDeque<Query>();
         boolean complete = false;
@@ -280,6 +304,8 @@ final class NativeVmCapture {
     /** Called only inside a bounded server slice; never expands a descendant recipe. */
     private FrozenPattern freeze(IPatternDetails pattern, java.util.ArrayDeque<Query> primaries) {
         checkCancellation();
+        if (catalog != null && catalog.nativePattern(pattern) != null)
+            return freezeNative(pattern, catalog.nativePattern(pattern));
         String id = liveIds.get(pattern);
         if (id != null) return frozen.get(id);
         bounded(patterns.size());
@@ -316,6 +342,38 @@ final class NativeVmCapture {
         primaries.addAll(capturedQueries);
         frozen.put(id, value);
         frozenIds.put(value, id);
+        return value;
+    }
+
+    private FrozenPattern freezeNative(IPatternDetails pattern, NativeVmPatternCatalog.NativePattern metadata) {
+        checkCancellation();
+        var existing = liveIds.get(pattern);
+        if (existing != null) return frozen.get(existing);
+        bounded(patterns.size());
+        String id = "vm-" + patterns.size();
+        var slots = new IPatternDetails.IInput[metadata.shape().inputs().size()];
+        var pendingInputs = new LinkedHashMap<Slot, FrozenInput>();
+        var pendingObservations = new LinkedHashMap<Query, Observation>();
+        for (int index = 0; index < slots.length; index++) {
+            checkCancellation();
+            var shape = metadata.shape().inputs().get(index);
+            var templates = shape.templates().toArray(GenericStack[]::new);
+            var key = templates[0].what();
+            stock.amount(key);
+            var slot = new Slot(id, index);
+            var input = new FrozenInput(slot, templates, shape.multiplier(), key, catalog.emittable(key), true);
+            slots[index] = input;
+            pendingInputs.put(slot, input);
+            pendingObservations.put(new Query(slot, key), new Observation(true, null));
+        }
+        var value = new FrozenPattern(metadata.definition(), slots, metadata.shape().outputs().toArray(GenericStack[]::new));
+        patterns.put(id, new Captured(pattern, metadata.shape(), metadata.definition()));
+        liveIds.put(pattern, id);
+        inputs.putAll(pendingInputs);
+        observations.putAll(pendingObservations);
+        frozen.put(id, value);
+        frozenIds.put(value, id);
+        sharedNativePatterns.add(id);
         return value;
     }
 
@@ -370,7 +428,9 @@ final class NativeVmCapture {
         observations.put(query, read(patterns.get(slot.id()).pattern().getInputs()[slot.index()], query.key()));
     }
 
-    private void checkCancellation() {
+    long now() { return timing.now(); }
+
+    void checkCancellation() {
         if (worker.isInterrupted()) cancelled = true;
         if (cancelled) throw new CancellationException("VM capture cancelled");
     }
@@ -386,22 +446,28 @@ final class NativeVmCapture {
         // Stock is intentionally NOT compared: the result describes its snapshot;
         // AE2/exact execution must reserve against current storage at submission.
         List<Runnable> checks = new ArrayList<>();
-        for (var entry : producers.entrySet()) if (demandedKeys.contains(entry.getKey())) checks.add(() -> {
+        // #218: unchanged registered native patterns are immutable; dynamic callbacks are not.
+        if (catalog != null) callServer(() -> null);
+        for (var entry : producers.entrySet()) if (demandedKeys.contains(entry.getKey())
+                && (catalog == null || entry.getValue().stream().anyMatch(pattern -> catalog.nativePattern(pattern) == null))) checks.add(() -> {
             if (!entry.getValue().equals(List.copyOf(patternGrid.getCraftingService().getCraftingFor(entry.getKey()))))
                 throw new NativeVm.Changed("provider binding changed");
         });
-        for (var entry : patterns.entrySet()) if (demandedPatterns.contains(entry.getKey())) checks.add(() -> {
+        for (var entry : patterns.entrySet()) if (demandedPatterns.contains(entry.getKey())
+                && !sharedNativePatterns.contains(entry.getKey())) checks.add(() -> {
             var captured = entry.getValue();
             if (!captured.shape().equals(shape(captured.pattern()))) throw new NativeVm.Changed("pattern shape changed");
         });
-        for (var entry : inputs.entrySet()) if (demandedPatterns.contains(entry.getKey().id())) checks.add(() -> {
+        for (var entry : inputs.entrySet()) if (demandedPatterns.contains(entry.getKey().id())
+                && !sharedNativePatterns.contains(entry.getKey().id())) checks.add(() -> {
             var actual = patterns.get(entry.getKey().id()).pattern().getInputs()[entry.getKey().index()];
             var expected = entry.getValue();
             if (!Objects.equals(expected.craftedKey(), selectCrafted(actual, List.of(expected.templates)))
                     || expected.emittable() != patternGrid.getCraftingService().canEmitFor(expected.templates[0].what()))
                 throw new NativeVm.Changed("input selection changed");
         });
-        for (var entry : observations.entrySet()) if (demandedPatterns.contains(entry.getKey().slot().id())) checks.add(() -> {
+        for (var entry : observations.entrySet()) if (demandedPatterns.contains(entry.getKey().slot().id())
+                && !sharedNativePatterns.contains(entry.getKey().slot().id())) checks.add(() -> {
             var slot = entry.getKey().slot();
             var actual = patterns.get(slot.id()).pattern().getInputs()[slot.index()];
             if (!entry.getValue().equals(read(actual, entry.getKey().key()))) throw new NativeVm.Changed("input observation changed");
@@ -468,7 +534,7 @@ final class NativeVmCapture {
         } finally { timing.unblocked(submitted); }
     }
 
-    private static Shape shape(IPatternDetails pattern) {
+    static Shape shape(IPatternDetails pattern) {
         List<SlotShape> inputs = new ArrayList<>();
         for (var input : pattern.getInputs()) {
             var templates = List.of(input.getPossibleInputs().clone());
@@ -485,9 +551,10 @@ final class NativeVmCapture {
     private static void bounded(int count) {
         if (count >= 1_048_576) throw new IllegalStateException("VM capture resident limit exceeded");
     }
-    private record Start(IGrid patternGrid, long epoch, long recipes, VmAccounting.Stock stock) { }
-    private record SlotShape(long multiplier, List<GenericStack> templates) { }
-    private record Shape(List<SlotShape> inputs, List<GenericStack> outputs) { }
+    private record Start(IGrid patternGrid, long epoch, long recipes, VmAccounting.Stock stock,
+            boolean shared, NativeVmPatternCatalog catalog) { }
+    record SlotShape(long multiplier, List<GenericStack> templates) { }
+    record Shape(List<SlotShape> inputs, List<GenericStack> outputs) { }
     private record Captured(IPatternDetails pattern, Shape shape, AEItemKey definition) { }
     private record Slot(String id, int index) { }
     private record Query(Slot slot, AEKey key) { }

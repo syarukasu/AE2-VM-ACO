@@ -22,7 +22,20 @@ back their quantities without discarding the observations used for replay
 guards. Pattern bytecode is compiled once per captured request scope; no
 stock-dependent plan is shared between requests.
 
-The per-order catalog may prefetch single-producer native processing inputs
+The hooked native CraftingService now shares immutable registered pattern
+metadata between orders, keyed by grid/server/provider epoch/recipe epoch.
+Cold metadata is built in 2 ms / 32-entry slices; unchanged native processing
+patterns require no server handoff during VM execution, followed by one final
+version check. Retention is capped at 16 grids and 65,536 keys/candidate entries
+per grid and cleared on provider changes, recipe reload and server stop.
+Stock, virtual inventories, dynamic predicates and plans are never shared.
+Unknown callbacks are not invoked for unused catalog entries; only exact native
+processing semantics are worker-readable. Oversized catalogs and unhooked
+services use the existing bounded demand path with the same VM, not another
+planner. Snapshot setup/copying and individual callbacks are not preemptible.
+All timing claims require real measurements, including cold setup cost.
+
+The fallback per-order catalog may prefetch single-producer native processing inputs
 inside the existing 2 ms / 32-pattern / 128-observation server slice. It stops
 at stocked intermediates, emitters, alternate/custom producers, or an incomplete
 stock proof. This is metadata only: unused prefetched patterns are not part of
