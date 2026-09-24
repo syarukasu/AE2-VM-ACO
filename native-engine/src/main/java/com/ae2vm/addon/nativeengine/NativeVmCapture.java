@@ -29,6 +29,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     private final IGrid grid;
     private final Level level;
     private final Thread worker = Thread.currentThread();
+    private volatile boolean cancelled;
     private final long epoch;
     private final long recipeEpoch;
     private final VmAccounting.Stock stock;
@@ -98,61 +99,25 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             return null;
         });
         Map<String, FrozenPattern> frozen = new LinkedHashMap<>();
-        var entries = new ArrayList<>(patterns.entrySet());
-        var known = new java.util.LinkedHashSet<AEKey>(stock.amounts().keySet());
-        known.addAll(seen);
-        entries.forEach(entry -> entry.getValue().shape().outputs().forEach(output -> known.add(output.what())));
-        var knownKeys = newIndex();
-        known.forEach(knownKeys::add);
-        int knownBefore;
-        do {
-        knownBefore = known.size();
-        for (int start = 0; start < entries.size();) {
-            final int first = start;
-            int next = callServer(() -> {
-                long deadline = System.nanoTime() + 2_000_000L;
-                int i = first;
-                for (; i < entries.size(); i++) {
-                    var entry = entries.get(i);
-                    var shape = entry.getValue().shape();
-                    var slots = new IPatternDetails.IInput[shape.inputs().size()];
-                    var code = codeByPattern.get(entry.getValue().pattern());
-                    for (int slot = 0; slot < slots.length; slot++) {
-                        var capturedInput = input(code, slot);
-                        var accepted = new LinkedHashMap<AEKey, Boolean>();
-                        var remaining = new LinkedHashMap<AEKey, AEKey>();
-                        var candidates = new java.util.ArrayDeque<AEKey>();
-                        var visited = new java.util.HashSet<AEKey>();
-                        for (var template : capturedInput.templates()) {
-                            candidates.add(template.key());
-                            candidates.addAll(knownKeys.fuzzy(template.key()));
-                        }
-                        while (!candidates.isEmpty()) {
-                            var variant = candidates.remove();
-                            if (!visited.add(variant)) continue;
-                            if (capturedInput.templates().stream().noneMatch(t -> t.key().fuzzyEquals(variant, FuzzyMode.IGNORE_ALL))) continue;
-                            var observation = observe(new Slot(entry.getKey(), slot), variant);
-                            accepted.put(variant, observation.valid());
-                            if (observation.remainder() != null) {
-                                remaining.put(variant, observation.remainder());
-                                if (known.add(observation.remainder())) knownKeys.add(observation.remainder());
-                                candidates.add(observation.remainder());
-                            }
-                        }
-                        accepted.keySet().forEach(stock::amount);
-                        slots[slot] = new FrozenInput(shape.inputs().get(slot).templates().toArray(GenericStack[]::new),
-                                shape.inputs().get(slot).multiplier().longValueExact(), Map.copyOf(remaining),
-                                Map.copyOf(accepted), capturedInput.craftedKey(), capturedInput.emittable());
-                    }
-                    frozen.put(entry.getKey(), new FrozenPattern(entry.getValue().pattern().getDefinition(),
-                            slots, shape.outputs().toArray(GenericStack[]::new)));
-                    if (System.nanoTime() >= deadline) return i + 1;
-                }
-                return i;
-            });
-            start = next;
+        var primaries = new java.util.LinkedHashSet<Query>();
+        // #215: capture structural inputs, never enumerate the closure of future returns.
+        for (var entry : patterns.entrySet()) {
+            var shape = entry.getValue().shape();
+            var slots = new IPatternDetails.IInput[shape.inputs().size()];
+            var code = codeByPattern.get(entry.getValue().pattern());
+            for (int slot = 0; slot < slots.length; slot++) {
+                var capturedInput = input(code, slot);
+                var id = new Slot(entry.getKey(), slot);
+                slots[slot] = new FrozenInput(id, shape.inputs().get(slot).templates().toArray(GenericStack[]::new),
+                        shape.inputs().get(slot).multiplier().longValueExact(),
+                        capturedInput.craftedKey(), capturedInput.emittable());
+                primaries.add(new Query(id, capturedInput.templates().get(0).key()));
+                primaries.add(new Query(id, capturedInput.craftedKey()));
+            }
+            frozen.put(entry.getKey(), new FrozenPattern(entry.getValue().definition(),
+                    slots, shape.outputs().toArray(GenericStack[]::new)));
         }
-        } while (known.size() != knownBefore);
+        prepareQueries(new ArrayList<>(primaries));
         Map<IPatternDetails, String> ids = new IdentityHashMap<>();
         frozen.forEach((id, pattern) -> ids.put(pattern, id));
         Map<AEKey, List<IPatternDetails>> byOutput = new LinkedHashMap<>();
@@ -177,17 +142,32 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
         }
     }
 
-    private record FrozenInput(GenericStack[] templates, long multiplier, Map<AEKey, AEKey> remaining,
-            Map<AEKey, Boolean> accepted, AEKey craftedKey, boolean emittable)
-            implements PatternCompiler.DetachedInput {
+    private final class FrozenInput implements PatternCompiler.DetachedInput {
+        private final Slot slot;
+        private final GenericStack[] templates;
+        private final long multiplier;
+        private final AEKey craftedKey;
+        private final boolean emittable;
+        FrozenInput(Slot slot, GenericStack[] templates, long multiplier, AEKey craftedKey, boolean emittable) {
+            this.slot = slot; this.templates = templates; this.multiplier = multiplier;
+            this.craftedKey = craftedKey; this.emittable = emittable;
+        }
         public GenericStack[] getPossibleInputs() { return templates.clone(); }
         public long getMultiplier() { return multiplier; }
-        public boolean isValid(AEKey key, Level ignored) {
-            var valid = accepted.get(key);
-            if (valid == null) throw new IllegalStateException("VM input observation missing: " + key);
-            return valid;
+        public AEKey craftedKey() { return craftedKey; }
+        public boolean emittable() { return emittable; }
+        public void prepareCandidates(java.util.Collection<AEKey> keys) {
+            var pending = new java.util.LinkedHashSet<Query>();
+            for (var key : keys) {
+                var query = new Query(slot, key);
+                if (!observations.containsKey(query)) pending.add(query);
+            }
+            prepareQueries(new ArrayList<>(pending));
         }
-        public AEKey getRemainingKey(AEKey key) { return remaining.get(key); }
+        public boolean isValid(AEKey key, Level ignored) {
+            return observe(slot, key).valid();
+        }
+        public AEKey getRemainingKey(AEKey key) { return observe(slot, key).remainder(); }
     }
     private record FrozenPattern(AEItemKey definition, IPatternDetails.IInput[] inputs, GenericStack[] outputs)
             implements PatternCompiler.DetachedPattern {
@@ -209,7 +189,8 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
             for (var pattern : current) {
                 var code = codeByPattern.get(pattern);
                 if (code == null) {
-                    var shape = callServer(() -> shape(pattern));
+                    var captured = callServer(() -> new Captured(pattern, shape(pattern), pattern.getDefinition()));
+                    var shape = captured.shape();
                     String id = "vm-" + patterns.size();
                     List<ExactBranchBytecode.InputSlot<AEKey>> slots = new ArrayList<>();
                     for (var input : shape.inputs()) {
@@ -223,7 +204,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
                     for (var output : shape.outputs()) outputs.merge(output.what(),
                             BigInteger.valueOf(output.amount()), BigInteger::add);
                     code = new ExactBranchBytecode<>(id, slots, outputs);
-                    patterns.put(id, new Captured(pattern, shape));
+                    patterns.put(id, captured);
                     codeByPattern.put(pattern, code);
                 }
                 result.add(code);
@@ -262,10 +243,34 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     }
 
     private Observation<AEKey> observe(Slot slot, AEKey key) {
-        return observations.computeIfAbsent(new Query(slot, key), query -> {
-            bounded(observations.size());
-            return callServer(() -> read(patterns.get(slot.id()).pattern().getInputs()[slot.index()], key));
-        });
+        var query = new Query(slot, key);
+        if (!observations.containsKey(query)) prepareQueries(List.of(query));
+        return Objects.requireNonNull(observations.get(query));
+    }
+
+    private void prepareQueries(List<Query> queries) {
+        for (int start = 0; start < queries.size();) {
+            final int first = start;
+            start = callServer(() -> {
+                long deadline = System.nanoTime() + 2_000_000L;
+                int i = first;
+                do {
+                    if (cancelled || worker.isInterrupted()) throw new CancellationException("VM input capture cancelled");
+                    var query = queries.get(i++);
+                    if (!observations.containsKey(query)) {
+                        var slot = query.slot();
+                        if (observations.size() >= 1_048_576)
+                            throw new IllegalStateException("VM observed input budget exceeded: patterns=" + patterns.size()
+                                    + ", observations=" + observations.size() + ", pattern=" + slot.id()
+                                    + ", slot=" + slot.index() + ", key=" + query.key());
+                        stock.amount(query.key());
+                        observations.put(query, read(patterns.get(slot.id()).pattern().getInputs()[slot.index()], query.key()));
+                    }
+                } while (i < queries.size() && i - first < 128 && System.nanoTime() < deadline);
+                return i;
+            });
+            progress.accept(observations.size());
+        }
     }
 
     private Observation<AEKey> read(IPatternDetails.IInput input, AEKey key) {
@@ -333,7 +338,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     private <T> T callServer(Supplier<T> action, boolean validateEpoch) {
         var server = Objects.requireNonNull(level.getServer());
         Supplier<T> checked = () -> {
-            if (worker.isInterrupted() || server.isStopped()) throw new CancellationException("VM cancelled");
+            if (cancelled || worker.isInterrupted() || server.isStopped()) throw new CancellationException("VM cancelled");
             if (validateEpoch && (epoch != NativeVm.epoch(grid) || recipeEpoch != NativeVm.recipeEpoch()))
                 throw new NativeVm.Changed("pattern/recipe epoch changed");
             return action.get();
@@ -342,6 +347,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
         var future = server.submit(checked);
         try { return future.get(); }
         catch (InterruptedException interrupted) {
+            cancelled = true;
             future.cancel(false); Thread.currentThread().interrupt(); throw new CancellationException("VM interrupted");
         } catch (ExecutionException failed) {
             if (failed.getCause() instanceof RuntimeException runtime) throw runtime;
@@ -386,7 +392,7 @@ final class NativeVmCapture implements ExactBranchInputRules<AEKey> {
     private record Start(long epoch, long recipes, VmAccounting.Stock stock) { }
     private record SlotShape(BigInteger multiplier, List<GenericStack> templates) { }
     private record Shape(List<SlotShape> inputs, List<GenericStack> outputs) { }
-    private record Captured(IPatternDetails pattern, Shape shape) { }
+    private record Captured(IPatternDetails pattern, Shape shape, AEItemKey definition) { }
     private record Slot(String id, int index) { }
     private record Query(Slot slot, AEKey key) { }
 }

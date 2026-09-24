@@ -17,6 +17,7 @@ final class NativeVmDiagnostics {
     private long lastSlow;
     private long started, completed, missing, cancelled, failed, recaptures, slow;
     private long totalMillis, maxMillis;
+    private final java.util.ArrayDeque<NativeVm.CalculationSample> recent = new java.util.ArrayDeque<>();
 
     NativeVmDiagnostics(Logger log, LongSupplier clock, boolean verbose) {
         this.log = log;
@@ -27,6 +28,13 @@ final class NativeVmDiagnostics {
     }
 
     boolean verbose() { return verbose; }
+
+    synchronized void record(NativeVm.CalculationSample sample) {
+        if (recent.size() == 64) recent.removeFirst();
+        recent.addLast(sample);
+    }
+
+    synchronized java.util.List<NativeVm.CalculationSample> recent() { return java.util.List.copyOf(recent); }
 
     synchronized void started() { started++; summarize(); }
     synchronized void cancelled() { cancelled++; summarize(); }

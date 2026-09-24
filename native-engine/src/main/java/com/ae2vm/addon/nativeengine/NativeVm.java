@@ -46,6 +46,11 @@ public final class NativeVm {
     private static volatile VmAccounting accounting;
     private NativeVm() { }
 
+    public record CalculationSample(long order, String output, BigInteger requested, long elapsedMillis, String status) { }
+
+    /** Bounded diagnostics only; never a cache of plans or world references. */
+    public static java.util.List<CalculationSample> recentCalculations() { return DIAGNOSTICS.recent(); }
+
     public static void installAccounting(VmAccounting extension) {
         if (accounting != null && accounting != extension) throw new IllegalStateException("VM accounting already registered");
         accounting = Objects.requireNonNull(extension);
@@ -107,6 +112,8 @@ public final class NativeVm {
                         }
                         return ordinaryPlan(exact);
                     });
+                    DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
+                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation() ? "missing" : "ready"));
                     DIAGNOSTICS.completed(order, output.getId(), request,
                             TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation());
                     if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} output={} requested={} "
@@ -125,10 +132,14 @@ public final class NativeVm {
                 }
             }
         } catch (CancellationException cancelled) {
+            DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "cancelled"));
             DIAGNOSTICS.cancelled();
             if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=cancelled order={}", order);
             throw cancelled;
         } catch (RuntimeException failure) {
+            DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
+                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "failed"));
             DIAGNOSTICS.failed(order, output.getId(), request, failure);
             throw failure;
         }

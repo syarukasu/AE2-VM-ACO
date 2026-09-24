@@ -152,22 +152,27 @@ final class VmInstructionExecution {
             remaining = remaining.subtract(state.extract(node.key, remaining));
         } else {
             // Use AE2's key index for ordering only; quantities are never stored as long.
-            var templates = new ArrayList<VmStack>();
             for (var template : node.input.getPossibleInputs()) {
-                for (var entry : state.fuzzy(template.what())) {
-                    var key = entry.getKey();
-                    if (node.input.isValid(key, null)) templates.add(new VmStack(key, BigInteger.valueOf(template.amount())));
-                }
-            }
-            for (var template : templates) {
                 if (remaining.signum() == 0) break;
-                var wanted = remaining.multiply(template.amount());
-                var available = state.read(template.what(), wanted);
-                var taken = available.min(wanted).divide(template.amount());
-                if (taken.signum() == 0) continue;
-                state.extract(template.what(), taken.multiply(template.amount()));
-                remaining = remaining.subtract(taken);
-                addReturn(node, template.what(), taken, returns);
+                var candidates = state.fuzzy(template.what()).iterator();
+                var unit = BigInteger.valueOf(template.amount());
+                while (remaining.signum() > 0 && candidates.hasNext()) {
+                    // #215: do not allocate or observe a whole fuzzy-family cross product.
+                    var batch = new ArrayList<AEKey>(128);
+                    while (batch.size() < 128 && candidates.hasNext()) batch.add(candidates.next().getKey());
+                    if (node.input instanceof PatternCompiler.DetachedInput detached) detached.prepareCandidates(batch);
+                    for (var key : batch) {
+                        if (remaining.signum() == 0) break;
+                        if (!node.input.isValid(key, null)) continue;
+                        var wanted = remaining.multiply(unit);
+                        var available = state.read(key, wanted);
+                        var taken = available.min(wanted).divide(unit);
+                        if (taken.signum() == 0) continue;
+                        state.extract(key, taken.multiply(unit));
+                        remaining = remaining.subtract(taken);
+                        addReturn(node, key, taken, returns);
+                    }
+                }
             }
         }
         if (remaining.signum() == 0) return;

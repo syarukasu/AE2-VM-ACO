@@ -22,6 +22,14 @@ back their quantities without discarding the observations used for replay
 guards. Pattern bytecode is compiled once per captured request scope; no
 stock-dependent plan is shared between requests.
 
+Input shapes and primary rules are captured first. Other validity/return rules
+are acquired on demand, only for candidates encountered in the VM inventory,
+in server-owned batches of at most 128 checks / two milliseconds (a single
+callback cannot be preempted). Future returned damage states are not enumerated.
+Observed values are retained per request and revalidated before adoption;
+unobserved variants are never assumed equivalent. Cancellation stays latched
+even after a worker clears its interrupt. Actual retained-data safeguards remain.
+
 ## Build and Test
 
 The controlled Forge build is in the sibling ACO rc.4 recovery worktree:
@@ -61,6 +69,12 @@ argument `-Dae2vm.diagnostics.verbose=true` (and a logger accepting DEBUG).
 Changing the logger to DEBUG alone does not enable per-order traces.
 
 These diagnostics do not alter calculation, cancellation or exact accounting.
+
+The last 64 ready/missing/failed/cancelled calculations are retained without
+per-order logging. ACO exposes them to operators via `/aco vm recent [1..64]`.
+Samples contain the item ID, exact request, status and worker elapsed time
+(including capture waits, excluding time queued before worker execution).
+They do not prove physical craft completion or retain grid/world references.
 
 ## Boundaries
 

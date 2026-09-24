@@ -18,6 +18,8 @@ public class PatternCompiler {
    public interface DetachedInput extends IInput {
       AEKey craftedKey();
       boolean emittable();
+      /** Observe only candidates encountered by this VM request, in a server-owned batch. */
+      default void prepareCandidates(java.util.Collection<AEKey> keys) { }
    }
    public interface Scope extends AutoCloseable { @Override void close(); }
    private static final class State {
