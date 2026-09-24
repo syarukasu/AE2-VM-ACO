@@ -199,14 +199,19 @@ final class VmInstructionExecution {
                     if (optimizedGuards && state.amount(key).compareTo(unit) < 0) {
                         // A later return can replenish this key; enclosing replay guards must see the skip.
                         state.read(key, unit);
-                    } else batch.add(new Candidate(key, unit));
+                    } else {
+                        batch.add(new Candidate(key, unit));
+                        if (batch.size() == 1 && node.input instanceof PatternCompiler.DetachedInput detached
+                                && detached.isCandidatePrepared(key)) break;
+                    }
                 }
                 if (batch.isEmpty()) continue;
-                if (node.input instanceof PatternCompiler.DetachedInput detached)
-                    detached.prepareCandidates(batch.stream().map(Candidate::key).toList());
-                for (var candidate : batch) {
+                for (int index = 0; index < batch.size(); index++) {
                     if (remaining.signum() == 0) break;
+                    var candidate = batch.get(index);
                     var key = candidate.key();
+                    if (node.input instanceof PatternCompiler.DetachedInput detached && !detached.isCandidatePrepared(key))
+                        detached.prepareCandidates(batch.subList(index, batch.size()).stream().map(Candidate::key).toList());
                     if (!node.input.isValid(key, null)) continue;
                     var wanted = remaining.multiply(candidate.unit());
                     var available = state.read(key, wanted);

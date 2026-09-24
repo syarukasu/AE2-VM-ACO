@@ -50,7 +50,9 @@ in server-owned batches of at most 128 checks / two milliseconds (a single
 callback cannot be preempted). Future returned damage states are not enumerated.
 Candidate batches span templates of the current input, preserving template/fuzzy
 priority and each template's unit. They never expand a future return or an unused
-recipe. A 384-single-candidate fixture uses 3 input handoffs instead of 383; this
+recipe. A cached prefix is consumed before requesting an uncached batch, so a
+fully stocked primary keeps its zero-input-handoff path. A 384-single-candidate
+fixture uses 3 input handoffs instead of 383; this
 does not establish production wall-clock speed. Only consulted observations are
 revalidated before adoption. Speculative callback failures are retained and thrown
 if the VM consults that candidate; cancellation, epoch changes and fatal errors

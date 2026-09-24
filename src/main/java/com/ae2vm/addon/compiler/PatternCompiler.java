@@ -22,6 +22,8 @@ public class PatternCompiler {
       default AEKey exactKey() { return null; }
       /** Observe only candidates encountered by this VM request, in a server-owned batch. */
       default void prepareCandidates(java.util.Collection<AEKey> keys) { }
+      /** Readiness only, not validity: preserve the ordered cached prefix without speculative handoffs. */
+      default boolean isCandidatePrepared(AEKey key) { return false; }
    }
    public interface Scope extends AutoCloseable { @Override void close(); }
    private static final class State {

@@ -186,6 +186,7 @@ final class NativeVmCapture {
             }
             prepareQueries(new ArrayList<>(pending));
         }
+        public boolean isCandidatePrepared(AEKey key) { return observations.containsKey(new Query(slot, key)); }
         public boolean isValid(AEKey key, Level ignored) {
             if (exactKey() != null) return key.matches(templates[0]);
             return observe(slot, key).valid();
