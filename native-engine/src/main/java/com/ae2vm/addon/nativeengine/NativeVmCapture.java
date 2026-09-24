@@ -14,9 +14,11 @@ import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
@@ -36,6 +38,9 @@ final class NativeVmCapture {
     private final Map<AEKey, List<IPatternDetails>> programs = new LinkedHashMap<>();
     private final Map<AEKey, List<IPatternDetails>> producers = new LinkedHashMap<>();
     private final Map<AEKey, Boolean> emitters = new LinkedHashMap<>();
+    private final Set<AEKey> demandedKeys = new LinkedHashSet<>();
+    private final Set<String> demandedPatterns = new LinkedHashSet<>();
+    private final Map<AEKey, RuntimeException> deferredFailures = new LinkedHashMap<>();
     private final Map<IPatternDetails, String> liveIds = new IdentityHashMap<>();
     private final Map<IPatternDetails, String> frozenIds = new IdentityHashMap<>();
     private final Map<String, FrozenPattern> frozen = new LinkedHashMap<>();
@@ -187,8 +192,9 @@ final class NativeVmCapture {
 
     private List<IPatternDetails> candidates(AEKey key) {
         if (patternGrid == null) return List.of();
+        if (deferredFailures.containsKey(key)) throw deferredFailures.get(key);
         var cached = programs.get(key);
-        if (cached != null) return cached;
+        if (cached != null) return demand(key, cached);
         bounded(programs.size());
         var result = new ArrayList<IPatternDetails>();
         var primaries = new java.util.ArrayDeque<Query>();
@@ -208,27 +214,83 @@ final class NativeVmCapture {
                         captured++;
                     } else break;
                 } while (observed < 128 && timing.now() < deadline);
-                return result.size() == current.size() && primaries.isEmpty();
+                boolean finished = result.size() == current.size() && primaries.isEmpty();
+                if (finished && current.size() == 1 && stock.complete())
+                    prefetchNativeInputs(result.get(0), deadline, 32 - captured, 128 - observed);
+                return finished;
             });
             progress.accept(observations.size());
         }
         var value = List.copyOf(result);
         programs.put(key, value);
-        return value;
+        return demand(key, value);
+    }
+
+    private List<IPatternDetails> demand(AEKey key, List<IPatternDetails> choices) {
+        demandedKeys.add(key);
+        for (var pattern : choices) demandedPatterns.add(Objects.requireNonNull(frozenIds.get(pattern)));
+        return choices;
+    }
+
+    /** #218: bounded metadata lookahead, not execution or a shared stock-dependent plan cache. */
+    private void prefetchNativeInputs(IPatternDetails first, long deadline, int patternBudget, int observationBudget) {
+        var pending = new java.util.ArrayDeque<AEKey>();
+        var visited = new java.util.HashSet<AEKey>();
+        enqueueNativeInputs(first, pending);
+        int examined = 0;
+        while (!pending.isEmpty() && examined++ < 32 && patternBudget > 0 && observationBudget > 0
+                && timing.now() < deadline) {
+            checkCancellation();
+            var key = pending.remove();
+            if (!visited.add(key) || programs.containsKey(key) || deferredFailures.containsKey(key)) continue;
+            try {
+                bounded(programs.size());
+                var choices = producers.computeIfAbsent(key,
+                        ignored -> List.copyOf(patternGrid.getCraftingService().getCraftingFor(key)));
+                if (choices.isEmpty()) { programs.put(key, List.of()); continue; }
+                if (choices.size() != 1 || choices.get(0).getClass() != appeng.crafting.pattern.AEProcessingPattern.class)
+                    continue;
+                // Never leave a partially observed speculative pattern in the ready catalog.
+                if (choices.get(0).getInputs().length * 2 > observationBudget) break;
+                var primaries = new java.util.ArrayDeque<Query>();
+                var pattern = freeze(choices.get(0), primaries);
+                patternBudget--;
+                while (!primaries.isEmpty()) { captureQuery(primaries.remove()); observationBudget--; }
+                programs.put(key, List.of(pattern));
+                enqueueNativeInputs(pattern, pending);
+            } catch (NativeVm.Changed | CancellationException failure) {
+                throw failure;
+            } catch (RuntimeException failure) {
+                // An unused branch is not a dependency. Surface the original error only if demanded.
+                deferredFailures.put(key, failure);
+            }
+        }
+    }
+
+    private void enqueueNativeInputs(IPatternDetails frozenPattern, java.util.ArrayDeque<AEKey> pending) {
+        var captured = patterns.get(frozenIds.get(frozenPattern));
+        if (captured.pattern().getClass() != appeng.crafting.pattern.AEProcessingPattern.class) return;
+        for (var value : frozenPattern.getInputs()) {
+            var input = (FrozenInput) value;
+            var key = input.exactKey();
+            if (key != null && !input.emittable && stock.amount(key).signum() == 0) pending.add(key);
+        }
     }
 
     /** Called only inside a bounded server slice; never expands a descendant recipe. */
     private FrozenPattern freeze(IPatternDetails pattern, java.util.ArrayDeque<Query> primaries) {
+        checkCancellation();
         String id = liveIds.get(pattern);
         if (id != null) return frozen.get(id);
         bounded(patterns.size());
         id = "vm-" + patterns.size();
         var captured = new Captured(pattern, shape(pattern), pattern.getDefinition());
-        patterns.put(id, captured);
-        liveIds.put(pattern, id);
+        var capturedInputs = new LinkedHashMap<Slot, FrozenInput>();
+        var capturedQueries = new java.util.ArrayDeque<Query>();
         var sources = pattern.getInputs();
         var slots = new IPatternDetails.IInput[captured.shape().inputs().size()];
         for (int slot = 0; slot < slots.length; slot++) {
+            checkCancellation();
             var identity = new Slot(id, slot);
             var shape = captured.shape().inputs().get(slot);
             var templates = shape.templates().toArray(GenericStack[]::new);
@@ -239,28 +301,39 @@ final class NativeVmCapture {
                     pattern.getClass() == appeng.crafting.pattern.AEProcessingPattern.class
                             && source.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input")
                             && templates.length == 1);
-            inputs.put(identity, input);
+            capturedInputs.put(identity, input);
             slots[slot] = input;
-            primaries.add(new Query(identity, templates[0].what()));
-            if (!crafted.equals(templates[0].what())) primaries.add(new Query(identity, crafted));
+            capturedQueries.add(new Query(identity, templates[0].what()));
+            if (!crafted.equals(templates[0].what())) capturedQueries.add(new Query(identity, crafted));
         }
         var value = new FrozenPattern(captured.definition(), slots,
                 captured.shape().outputs().toArray(GenericStack[]::new));
+        // Failed speculation must not leave an alias pointing at a half-captured pattern.
+        checkCancellation();
+        patterns.put(id, captured);
+        liveIds.put(pattern, id);
+        inputs.putAll(capturedInputs);
+        primaries.addAll(capturedQueries);
         frozen.put(id, value);
         frozenIds.put(value, id);
         return value;
     }
 
     private AEKey selectCrafted(IPatternDetails.IInput source, List<GenericStack> templates) {
+        checkCancellation();
         var service = patternGrid.getCraftingService();
         AEKey encoded = templates.get(0).what();
-        if (!service.canEmitFor(encoded) && service.getCraftingFor(encoded).isEmpty()) {
+        boolean emitted = service.canEmitFor(encoded);
+        checkCancellation();
+        if (!emitted && service.getCraftingFor(encoded).isEmpty()) {
             for (var template : templates) {
+                checkCancellation();
                 if (template.amount() != templates.get(0).amount()) continue;
                 AEKey selected = service.getFuzzyCraftable(template.what(), key -> source.isValid(key, level));
                 if (selected != null) return selected;
             }
         }
+        checkCancellation();
         return encoded;
     }
 
@@ -286,7 +359,7 @@ final class NativeVmCapture {
     }
 
     private void captureQuery(Query query) {
-        if (cancelled || worker.isInterrupted()) throw new CancellationException("VM input capture cancelled");
+        checkCancellation();
         if (observations.containsKey(query)) return;
         var slot = query.slot();
         if (observations.size() >= 1_048_576)
@@ -295,6 +368,11 @@ final class NativeVmCapture {
                     + ", slot=" + slot.index() + ", key=" + query.key());
         stock.amount(query.key());
         observations.put(query, read(patterns.get(slot.id()).pattern().getInputs()[slot.index()], query.key()));
+    }
+
+    private void checkCancellation() {
+        if (worker.isInterrupted()) cancelled = true;
+        if (cancelled) throw new CancellationException("VM capture cancelled");
     }
 
     private Observation read(IPatternDetails.IInput input, AEKey key) {
@@ -308,21 +386,22 @@ final class NativeVmCapture {
         // Stock is intentionally NOT compared: the result describes its snapshot;
         // AE2/exact execution must reserve against current storage at submission.
         List<Runnable> checks = new ArrayList<>();
-        for (var entry : producers.entrySet()) checks.add(() -> {
+        for (var entry : producers.entrySet()) if (demandedKeys.contains(entry.getKey())) checks.add(() -> {
             if (!entry.getValue().equals(List.copyOf(patternGrid.getCraftingService().getCraftingFor(entry.getKey()))))
                 throw new NativeVm.Changed("provider binding changed");
         });
-        for (var captured : patterns.values()) checks.add(() -> {
+        for (var entry : patterns.entrySet()) if (demandedPatterns.contains(entry.getKey())) checks.add(() -> {
+            var captured = entry.getValue();
             if (!captured.shape().equals(shape(captured.pattern()))) throw new NativeVm.Changed("pattern shape changed");
         });
-        for (var entry : inputs.entrySet()) checks.add(() -> {
+        for (var entry : inputs.entrySet()) if (demandedPatterns.contains(entry.getKey().id())) checks.add(() -> {
             var actual = patterns.get(entry.getKey().id()).pattern().getInputs()[entry.getKey().index()];
             var expected = entry.getValue();
             if (!Objects.equals(expected.craftedKey(), selectCrafted(actual, List.of(expected.templates)))
                     || expected.emittable() != patternGrid.getCraftingService().canEmitFor(expected.templates[0].what()))
                 throw new NativeVm.Changed("input selection changed");
         });
-        for (var entry : observations.entrySet()) checks.add(() -> {
+        for (var entry : observations.entrySet()) if (demandedPatterns.contains(entry.getKey().slot().id())) checks.add(() -> {
             var slot = entry.getKey().slot();
             var actual = patterns.get(slot.id()).pattern().getInputs()[slot.index()];
             if (!entry.getValue().equals(read(actual, entry.getKey().key()))) throw new NativeVm.Changed("input observation changed");
@@ -345,7 +424,7 @@ final class NativeVmCapture {
 
     Map<String, IPatternDetails> bindings() {
         Map<String, IPatternDetails> result = new LinkedHashMap<>();
-        patterns.forEach((id, value) -> result.put(id, value.pattern()));
+        patterns.forEach((id, value) -> { if (demandedPatterns.contains(id)) result.put(id, value.pattern()); });
         return Map.copyOf(result);
     }
 

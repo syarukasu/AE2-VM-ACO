@@ -22,6 +22,15 @@ back their quantities without discarding the observations used for replay
 guards. Pattern bytecode is compiled once per captured request scope; no
 stock-dependent plan is shared between requests.
 
+The per-order catalog may prefetch single-producer native processing inputs
+inside the existing 2 ms / 32-pattern / 128-observation server slice. It stops
+at stocked intermediates, emitters, alternate/custom producers, or an incomplete
+stock proof. This is metadata only: unused prefetched patterns are not part of
+the adopted plan or its semantic validation set. Failed capture publishes no
+partial pattern, and cancellation is checked within capture work. A synthetic
+96-stage chain uses 19 server handoffs including validation instead of 112;
+this is an operation count, not an industrial-server speed measurement.
+
 Input shapes and primary rules are captured first. Other validity/return rules
 are acquired on demand, only for candidates encountered in the VM inventory,
 in server-owned batches of at most 128 checks / two milliseconds (a single
