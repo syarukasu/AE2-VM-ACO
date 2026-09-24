@@ -29,6 +29,7 @@ final class VmInstructionExecution {
     private boolean simulate;
     private long instructions;
     private long work;
+    private long stateCopies;
     private BigInteger skipped = ZERO;
     private final java.util.function.LongConsumer progress;
     private final List<Trace> traces = new ArrayList<>();
@@ -46,6 +47,7 @@ final class VmInstructionExecution {
     }
     long instructions() { return instructions; }
     long work() { return work; }
+    long stateCopies() { return stateCopies; }
     BigInteger skippedIterations() { return skipped; }
 
     VmCraftingPlan execute(BigInteger amount, boolean craftLess) {
@@ -182,6 +184,17 @@ final class VmInstructionExecution {
         var choices = node.processes();
         for (var process : choices) {
             var output = process.output(node.key);
+            // #217: bulk-only producers need no local replay snapshot. Enclosing traces still observe all reads.
+            if (choices.size() == 1 && !process.single) {
+                while (demand.signum() > 0) {
+                    checkpoint();
+                    run(process, PatternCompiler.ceilDiv(demand, output), state);
+                    var taken = state.extract(node.key, demand);
+                    if (taken.signum() == 0) throw new IllegalStateException("VM produced no requested output");
+                    demand = demand.subtract(taken);
+                }
+                return;
+            }
             var window = new Trace(state);
             traces.add(window);
             var windowOutput = ZERO;
@@ -284,7 +297,7 @@ final class VmInstructionExecution {
         final Map<Trace, Map<AEKey, BigInteger>> lows = new IdentityHashMap<>();
         final Map<Family, KeyCounter> keys = new HashMap<>();
         VmByteCost bytes = VmByteCost.ZERO;
-        State copy() { var copy = new State(); copy.adopt(this); return copy; }
+        State copy() { stateCopies++; var copy = new State(); copy.adopt(this); return copy; }
         void adopt(State other) {
             replace(stock, other.stock); replace(used, other.used); replace(emitted, other.emitted);
             replace(missing, other.missing); replace(patterns, other.patterns);

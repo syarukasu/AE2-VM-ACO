@@ -3,7 +3,7 @@ loaderVersion="[47,)"
 license="LGPL-3.0"
 [[mods]]
 modId="ae2vm_aco"
-version="0.3.1"
+version="0.3.2-dev.1"
 displayName="AE2 VM ACO Exact Fork"
 authors="AE2-VM contributors, syarukasu"
 description='''Native VM-owned crafting calculation with exact BigInteger accounting.'''
