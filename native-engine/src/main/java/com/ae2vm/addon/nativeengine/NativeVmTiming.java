@@ -14,7 +14,7 @@ final class NativeVmTiming {
     private final java.util.Map<String, Long> patternTypes = new java.util.LinkedHashMap<>();
     private long otherPatternTypes;
     private long queued, server, blocked, handoffs, vmActive;
-    private long copies, branchTrials, branchEntries;
+    private long copies, branchTrials, branchEntries, aggregatedBlocks;
 
     NativeVmTiming() { this(System::nanoTime); }
     NativeVmTiming(LongSupplier clock) { this.clock = clock; }
@@ -60,7 +60,11 @@ final class NativeVmTiming {
     }
     synchronized void unblocked(long started) { blocked += now() - started; }
     synchronized void execution(long copies, long branchTrials, long branchEntries) {
+        execution(copies, branchTrials, branchEntries, 0);
+    }
+    synchronized void execution(long copies, long branchTrials, long branchEntries, long aggregatedBlocks) {
         this.copies += copies; this.branchTrials += branchTrials; this.branchEntries += branchEntries;
+        this.aggregatedBlocks += aggregatedBlocks;
     }
     private static long ms(long nanos) { return TimeUnit.NANOSECONDS.toMillis(nanos); }
     private String categories(long[] values, boolean milliseconds) {
@@ -86,6 +90,6 @@ final class NativeVmTiming {
                 + " serverQueueByKindMs=" + categories(queueByKind, true)
                 + " patternTypes=" + types + " otherPatternTypes=" + otherPatternTypes
                 + " stateCopies=" + copies + " branchTrials=" + branchTrials
-                + " branchEntries=" + branchEntries;
+                + " branchEntries=" + branchEntries + " aggregatedBlocks=" + aggregatedBlocks;
     }
 }

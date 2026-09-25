@@ -11,8 +11,9 @@ import java.util.function.Predicate;
 
 /**
  * BigInteger fork of AE2-VM's compiled-pattern stack machine.
- * #208: state-dependent recipe effects use guarded, ordered block replay, never
- * an unconditionally multiplied one-craft stock/branch result. No ACO planner is called.
+ * #218: shared exact demands are compiled and combined before applying quantities.
+ * #208: state-dependent effects retain ordered semantics, never an unconditionally
+ * multiplied one-craft stock/branch result. No ACO planner is called.
  */
 public final class CraftingVM {
     private Function<AEKey, IPatternDetails> patternResolver;
@@ -22,6 +23,7 @@ public final class CraftingVM {
     private volatile boolean executing;
     private long instructions, work;
     private long stateCopies, branchTrials, branchEntries;
+    private long aggregatedBlocks;
     private BigInteger skipped = BigInteger.ZERO;
 
     public CraftingVM(Object networkKey, Function<AEKey, IPatternDetails> patternResolver) {
@@ -37,6 +39,7 @@ public final class CraftingVM {
     public long stateCopies() { return stateCopies; }
     public long branchTrials() { return branchTrials; }
     public long branchEntries() { return branchEntries; }
+    public long aggregatedBlocks() { return aggregatedBlocks; }
     public BigInteger skippedIterations() { return skipped; }
 
     public VmCraftingPlan execute(CraftingBytecode request, VmSimulationState simulation) {
@@ -60,6 +63,7 @@ public final class CraftingVM {
             stateCopies = interpreter.stateCopies();
             branchTrials = interpreter.branchTrials();
             branchEntries = interpreter.branchEntries();
+            aggregatedBlocks = interpreter.aggregatedBlocks();
             skipped = interpreter.skippedIterations();
             executing = false;
         }

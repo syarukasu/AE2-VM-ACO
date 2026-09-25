@@ -142,7 +142,7 @@ final class NativeVmCapture {
                 try {
                     result = vm.execute(PatternCompiler.compileRequest(root, requested),
                             new VmSimulationState(stock.amounts()), craftLess);
-                } finally { timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries()); }
+                } finally { timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries(), vm.aggregatedBlocks()); }
             }
             Map<String, BigInteger> crafts = new LinkedHashMap<>();
             result.patternTimes().forEach((pattern, count) -> crafts.merge(

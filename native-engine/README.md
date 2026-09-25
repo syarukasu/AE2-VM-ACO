@@ -7,8 +7,18 @@ depend on ACO graph/capture classes. VmAccounting is the optional exact-stock
 and finished-wide-result contract.
 
 The upstream compiler/stack-bytecode core is compiled into this native JAR.
-The unsafe one-craft aggregation was replaced inside the VM fork with ordered
-input instructions and guarded block replay. This is a semantic extension of
+Shared exact-input demands are again combined as compiled programs rather than
+expanded once per recipe path. Their coefficients, net outputs and byte charges
+are BigInteger/rational values. Only already-demanded definitions and prepared
+input semantics enter compilation. Unqueried producers remain stock-only
+boundaries until the VM actually needs to craft them; no eager capture is added.
+AE2's conceptual tree-node capacity is computed from compact shapes without
+allocating the equivalent tree. Ordinary stock changes are not recapture events.
+
+The original unconditional one-craft aggregation is not restored for stateful
+inputs. Alternatives, returned tools, internally consumed byproducts, cycles,
+non-whole batch ratios and stocked intermediates retain ordered instructions
+inside the same VM; this does not fall back to ACO or AE2's calculator. This is a semantic extension of
 the VM, not a claim that upstream's original aggregation was correct for every
 AE2 recipe. The copied rc.4 `ExactBranchVM` evaluator is removed. The upstream
 mod bootstrap, blocklist, config and mixins are not included; this module owns
@@ -109,6 +119,8 @@ individual order, explicitly enable per-order DEBUG traces with the Java
 argument `-Dae2vm.diagnostics.verbose=true` (and a logger accepting DEBUG).
 Changing the logger to DEBUG alone does not enable per-order traces.
 
+Existing timing summaries also include aggregatedBlocks, the number of applied
+shared-demand programs. No per-block log event is added.
 These diagnostics do not alter calculation, cancellation or exact accounting.
 
 The last 64 ready/missing/failed/cancelled calculations are retained without

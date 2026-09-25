@@ -25,13 +25,15 @@ final class VmInstructionExecution {
     private final Map<AEKey, BigInteger> initial;
     private final KeyCounter initialKeys = new KeyCounter();
     private final Node root;
-    private BigInteger nodes = ZERO;
+    private final Map<AEKey, List<IPatternDetails>> knownProducers = new HashMap<>();
+    private final VmDemandProgram.Compiler demandCompiler = new VmDemandProgram.Compiler(knownProducers);
     private boolean multiple;
     private boolean simulate;
     private long instructions;
     private long work;
     private long stateCopies;
     private long branchTrials, branchEntries;
+    private long aggregatedBlocks;
     private final boolean sparseBranches, optimizedGuards;
     private long stockKeyScans, minimumSnapshots, replays;
     private BigInteger skipped = ZERO;
@@ -61,6 +63,7 @@ final class VmInstructionExecution {
     long stateCopies() { return stateCopies; }
     long branchTrials() { return branchTrials; }
     long branchEntries() { return branchEntries; }
+    long aggregatedBlocks() { return aggregatedBlocks; }
     long stockKeyScans() { return stockKeyScans; }
     long minimumSnapshots() { return minimumSnapshots; }
     long replays() { return replays; }
@@ -87,7 +90,7 @@ final class VmInstructionExecution {
         var state = new State();
         try { request(root, amount, state, null); }
         catch (Missing absent) { return null; }
-        state.bytes = state.bytes.add(new VmByteCost(nodes.multiply(BigInteger.valueOf(8)), ONE));
+        state.bytes = state.bytes.add(new VmByteCost(root.nodeCount(null).multiply(BigInteger.valueOf(8)), ONE));
         return new VmCraftingPlan(new VmStack(root.key, amount), state.bytes.ceiling(), simulation,
                 multiple, new VmKeyCounter(state.used), new VmKeyCounter(state.emitted),
                 new VmKeyCounter(state.missing), state.patterns);
@@ -107,13 +110,25 @@ final class VmInstructionExecution {
             this.unit = unit;
             key = input instanceof PatternCompiler.DetachedInput detached ? detached.craftedKey() : encoded;
             emit = input instanceof PatternCompiler.DetachedInput detached ? detached.emittable() : emitters.test(encoded);
-            nodes = nodes.add(ONE);
+        }
+
+        BigInteger nodeCount(VmDemandProgram inherited) {
+            var count = ONE;
+            boolean inheritedFound = false;
+            if (processes != null) for (var process : processes) {
+                var shape = inherited != null && inherited.pattern == process.pattern ? inherited : null;
+                inheritedFound |= shape != null;
+                count = count.add(process.nodeCount(shape));
+            }
+            if (inherited != null && !inheritedFound) count = count.add(inherited.nodes);
+            return count;
         }
 
         List<Process> processes() {
             if (processes != null) return processes;
             processes = new ArrayList<>();
-            for (var pattern : resolver.apply(key)) {
+            var definitions = knownProducers.computeIfAbsent(key, resolver);
+            for (var pattern : definitions) {
                 if (ancestor != null && ancestor.conflicts(pattern)) continue;
                 processes.add(new Process(pattern, this));
             }
@@ -137,8 +152,11 @@ final class VmInstructionExecution {
         final List<Node> inputs = new ArrayList<>();
         final boolean single;
         final boolean containers;
+        final Node parent;
+        VmDemandProgram aggregatedShape;
         Process(IPatternDetails pattern, Node parent) {
             this.pattern = pattern;
+            this.parent = parent;
             PatternCompiler.compileIfAbsent(pattern);
             code = Objects.requireNonNull(PatternCompiler.getCompiled(pattern));
             boolean limited = false, returned = false;
@@ -150,6 +168,14 @@ final class VmInstructionExecution {
             }
             single = limited;
             containers = returned;
+        }
+        BigInteger nodeCount(VmDemandProgram inherited) {
+            var shape = inherited;
+            if (aggregatedShape != null && (shape == null || shape.generation < aggregatedShape.generation)) shape = aggregatedShape;
+            var count = ZERO;
+            for (int i = 0; i < inputs.size(); i++)
+                count = count.add(inputs.get(i).nodeCount(shape == null ? null : shape.children.get(i)));
+            return count;
         }
         BigInteger output(AEKey key) {
             BigInteger amount = ZERO;
@@ -319,6 +345,10 @@ final class VmInstructionExecution {
 
     /** Execute original stack arithmetic/output opcodes plus slot-aware input/return instructions. */
     private void run(Process process, BigInteger times, State state) {
+        if (optimizedGuards && !process.single) {
+            var program = demandCompiler.get(process.pattern);
+            if (program != null && aggregate(process, program, times, state)) return;
+        }
         var code = process.code;
         var buffer = ByteBuffer.wrap(code.getCode());
         var stack = new ArrayDeque<BigInteger>();
@@ -356,6 +386,38 @@ final class VmInstructionExecution {
             }
         }
         throw new IllegalStateException("Unterminated VM program");
+    }
+
+    /** #218: combine shared demands once. No inventory snapshot or one-craft trial is multiplied. */
+    private boolean aggregate(Process process, VmDemandProgram program, BigInteger times, State state) {
+        if (times.remainder(program.period).signum() != 0) return false;
+        for (var ancestor = process.parent.ancestor; ancestor != null; ancestor = ancestor.ancestor)
+            if (program.dependencies.contains(ancestor.key)) return false;
+        for (var key : program.intermediates) if (state.amount(key).signum() != 0) return false;
+        for (var entry : program.needs.entrySet()) {
+            var leaf = program.leaves.get(entry.getKey());
+            if ((leaf.stockOnly() || !simulate && !leaf.emit())
+                    && state.amount(entry.getKey()).compareTo(entry.getValue().scale(times)) < 0) return false;
+        }
+        checkpoint();
+        aggregatedBlocks++;
+        // Preserve only actual dependencies for an enclosing state-dependent repetition.
+        for (var key : program.intermediates) state.read(key, ONE);
+        for (var entry : program.needs.entrySet()) {
+            checkpoint();
+            var key = entry.getKey();
+            var leaf = program.leaves.get(key);
+            var demand = entry.getValue().scale(times);
+            var taken = state.read(key, demand).min(demand).divide(leaf.unit()).multiply(leaf.unit());
+            state.extract(key, taken);
+            var remaining = demand.subtract(taken);
+            if (remaining.signum() > 0) merge(leaf.emit() ? state.emitted : state.missing, key, remaining);
+        }
+        program.outputs.forEach((key, amount) -> state.insert(key, amount.scale(times)));
+        program.crafts.forEach((pattern, amount) -> merge(state.patterns, pattern, amount.scale(times)));
+        state.bytes = state.bytes.add(program.bytes.multiply(times));
+        process.aggregatedShape = program;
+        return true;
     }
 
     private final class State {
