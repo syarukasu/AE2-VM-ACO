@@ -196,22 +196,25 @@ final class VmInstructionExecution {
                     if (!candidates.hasNext()) break;
                     checkpoint();
                     var key = candidates.next().getKey();
-                    if (optimizedGuards && state.amount(key).compareTo(unit) < 0) {
-                        // A later return can replenish this key; enclosing replay guards must see the skip.
-                        state.read(key, unit);
-                    } else {
-                        batch.add(new Candidate(key, unit));
-                        if (batch.size() == 1 && node.input instanceof PatternCompiler.DetachedInput detached
-                                && detached.isCandidatePrepared(key)) break;
-                    }
+                    // #218: lookahead must not add guards for candidates the ordered cursor never reaches.
+                    batch.add(new Candidate(key, unit));
+                    if (batch.size() == 1 && node.input instanceof PatternCompiler.DetachedInput detached
+                            && detached.isCandidatePrepared(key)) break;
                 }
                 if (batch.isEmpty()) continue;
                 for (int index = 0; index < batch.size(); index++) {
                     if (remaining.signum() == 0) break;
                     var candidate = batch.get(index);
                     var key = candidate.key();
+                    if (optimizedGuards && state.amount(key).compareTo(candidate.unit()) < 0) {
+                        // Keep the guard when this skip is actually needed: later returns can replenish it.
+                        state.read(key, candidate.unit());
+                        continue;
+                    }
                     if (node.input instanceof PatternCompiler.DetachedInput detached && !detached.isCandidatePrepared(key))
-                        detached.prepareCandidates(batch.subList(index, batch.size()).stream().map(Candidate::key).toList());
+                        detached.prepareCandidates(batch.subList(index, batch.size()).stream()
+                                .filter(next -> !optimizedGuards || state.amount(next.key()).compareTo(next.unit()) >= 0)
+                                .map(Candidate::key).toList());
                     if (!node.input.isValid(key, null)) continue;
                     var wanted = remaining.multiply(candidate.unit());
                     var available = state.read(key, wanted);
@@ -291,8 +294,8 @@ final class VmInstructionExecution {
                     }
                 } finally { traces.add(window); }
                 demand = demand.subtract(windowOutput.multiply(repeats));
-                if (repeats.signum() > 0 || !sameKeys
-                        || ++iterations >= windowSize) {
+                if (demand.signum() > 0 && (repeats.signum() > 0 || !sameKeys
+                        || ++iterations >= windowSize)) {
                     window.finish(state); traces.remove(traces.size() - 1);
                     window = new Trace(state); traces.add(window);
                     windowOutput = ZERO; iterations = 0;
@@ -387,6 +390,15 @@ final class VmInstructionExecution {
             parent.stockKeyVersion = stockKeyVersion; parent.bytes = bytes;
         }
         State copy() { stateCopies++; var copy = new State(); copy.adopt(this); return copy; }
+        State replayCopy() {
+            // #218: replay reads these quantities only, never copied low-water maps, used counts or fuzzy indexes.
+            stateCopies++;
+            var copy = new State();
+            replace(copy.stock, stock); replace(copy.emitted, emitted);
+            replace(copy.missing, missing); replace(copy.patterns, patterns);
+            copy.stockKeyVersion = stockKeyVersion; copy.bytes = bytes;
+            return copy;
+        }
         long entries() {
             return (long) stock.size() + used.size() + emitted.size() + missing.size() + patterns.size()
                     + keys.size() + lows.values().stream().mapToLong(Map::size).sum();
@@ -395,8 +407,8 @@ final class VmInstructionExecution {
             replace(stock, other.stock); replace(used, other.used); replace(emitted, other.emitted);
             replace(missing, other.missing); replace(patterns, other.patterns);
             stockKeyVersion = other.stockKeyVersion;
-            lows.clear(); other.lows.forEach((trace, low) -> lows.put(trace, new LinkedHashMap<>(low)));
-            keys.clear(); keys.putAll(other.keys); bytes = other.bytes;
+            lows.clear(); other.lows.forEach((trace, low) -> lows.put(trace, VmBranchMap.snapshot(low)));
+            keys.clear(); VmBranchMap.copyInto(other.keys, keys); bytes = other.bytes;
         }
         BigInteger amount(AEKey key) { return stock.getOrDefault(key, initial.getOrDefault(key, ZERO)); }
         boolean sameStockKeys(State other) {
@@ -451,13 +463,13 @@ final class VmInstructionExecution {
         final Map<AEKey, BigInteger> lower = new HashMap<>(), upper = new HashMap<>();
         Map<AEKey, BigInteger> minimum;
         Trace(State state) {
-            before = state.copy();
-            state.lows.put(this, new LinkedHashMap<>(state.stock));
+            before = state.replayCopy();
+            state.lows.put(this, VmBranchMap.snapshot(state.stock));
         }
         void finish(State state) { minimum = state.lows.remove(this); }
         void captureMinimum(State state) {
             minimumSnapshots++;
-            minimum = new LinkedHashMap<>(state.lows.get(this));
+            minimum = VmBranchMap.snapshot(state.lows.get(this));
         }
         void read(AEKey key, BigInteger available, BigInteger requested, State current) {
             var start = before.amount(key);
@@ -484,11 +496,10 @@ final class VmInstructionExecution {
         void replay(State state, BigInteger repeats) {
             replays++;
             skipped = skipped.add(repeats);
-            var after = state.copy();
             // Extend enclosing guards across every skipped iteration, including failed trials.
             for (var parent : traces) for (var key : lower.keySet()) {
                 var start = before.amount(key);
-                var delta = after.amount(key).subtract(start);
+                var delta = state.amount(key).subtract(start);
                 var offset = start.subtract(parent.before.amount(key));
                 var min = lower.get(key).subtract(offset).subtract(delta.min(ZERO).multiply(repeats));
                 parent.lower.merge(key, min, BigInteger::max);
@@ -496,9 +507,10 @@ final class VmInstructionExecution {
                 if (max != null) parent.upper.merge(key,
                         max.subtract(offset).subtract(delta.max(ZERO).multiply(repeats)), BigInteger::min);
             }
-            for (var key : after.stock.keySet()) {
-                var delta = after.amount(key).subtract(before.amount(key));
-                state.putStock(key, after.stock.get(key).add(delta.multiply(repeats)));
+            // Existing-key deltas are independent; keep the minimum snapshot separate, not the entire after-state.
+            for (var key : state.stock.keySet()) {
+                var delta = state.amount(key).subtract(before.amount(key));
+                state.putStock(key, state.stock.get(key).add(delta.multiply(repeats)));
                 var low = minimum.getOrDefault(key, before.amount(key));
                 if (delta.signum() < 0) low = low.add(delta.multiply(repeats));
                 var peak = initial.getOrDefault(key, ZERO).subtract(low);
@@ -506,20 +518,22 @@ final class VmInstructionExecution {
                 var actualLow = low;
                 state.lows.values().forEach(values -> values.merge(key, actualLow, BigInteger::min));
             }
-            scaleDelta(state.patterns, before.patterns, after.patterns, repeats);
-            scaleDelta(state.emitted, before.emitted, after.emitted, repeats);
-            scaleDelta(state.missing, before.missing, after.missing, repeats);
-            state.bytes = after.bytes.add(after.bytes.subtract(before.bytes).multiply(repeats));
+            scaleDelta(state.patterns, before.patterns, repeats);
+            scaleDelta(state.emitted, before.emitted, repeats);
+            scaleDelta(state.missing, before.missing, repeats);
+            state.bytes = state.bytes.add(state.bytes.subtract(before.bytes).multiply(repeats));
         }
     }
 
     private static <K> void merge(Map<K, BigInteger> map, K key, BigInteger value) {
         if (value.signum() != 0) map.merge(key, value, BigInteger::add);
     }
-    private static <K> void replace(Map<K, BigInteger> target, Map<K, BigInteger> source) { target.clear(); target.putAll(source); }
+    private static <K> void replace(Map<K, BigInteger> target, Map<K, BigInteger> source) {
+        target.clear(); VmBranchMap.copyInto(source, target);
+    }
     private static <K> void scaleDelta(Map<K, BigInteger> target, Map<K, BigInteger> before,
-            Map<K, BigInteger> after, BigInteger repeats) {
-        after.forEach((key, value) -> merge(target, key, value.subtract(before.getOrDefault(key, ZERO)).multiply(repeats)));
+            BigInteger repeats) {
+        target.forEach((key, value) -> merge(target, key, value.subtract(before.getOrDefault(key, ZERO)).multiply(repeats)));
     }
     private static void checkpoint() {
         if (Thread.currentThread().isInterrupted()) throw new CancellationException("VM calculation cancelled");

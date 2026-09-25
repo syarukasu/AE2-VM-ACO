@@ -1,6 +1,7 @@
 package com.ae2vm.addon.vm;
 
 import java.util.AbstractMap;
+import java.util.ArrayDeque;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -30,10 +31,22 @@ final class VmBranchMap<K, V> extends AbstractMap<K, V> {
     @Override public V remove(Object key) { throw new UnsupportedOperationException("Trial entries are not removed"); }
     @Override public void clear() { throw new UnsupportedOperationException("Discard the trial instead"); }
     @Override public Set<Entry<K, V>> entrySet() {
-        // Materialize only for snapshot/replay iteration, never for a branch write.
-        var merged = new LinkedHashMap<>(parent);
-        merged.putAll(changes);
-        return Collections.unmodifiableMap(merged).entrySet();
+        return Collections.unmodifiableMap(snapshot(this)).entrySet();
+    }
+    static <K, V> Map<K, V> snapshot(Map<K, V> source) {
+        var result = new LinkedHashMap<K, V>();
+        copyInto(source, result);
+        return result;
+    }
+    static <K, V> void copyInto(Map<K, V> source, Map<K, V> target) {
+        // #218: flatten once, not one full ancestor snapshot per nested trial.
+        var layers = new ArrayDeque<Map<K, V>>();
+        while (source instanceof VmBranchMap<K, V> branch) {
+            layers.addFirst(branch.changes);
+            source = branch.parent;
+        }
+        target.putAll(source);
+        for (var changes : layers) target.putAll(changes);
     }
     long changedEntries() { return changes.size(); }
     void commit() { changes.forEach(parent::put); }

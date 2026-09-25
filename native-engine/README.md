@@ -22,6 +22,17 @@ back their quantities without discarding the observations used for replay
 guards. Pattern bytecode is compiled once per captured request scope; no
 stock-dependent plan is shared between requests.
 
+Replay before-snapshots contain only quantities and metadata used by replay;
+they do not clone enclosing low-water maps, used-item maps or fuzzy indexes.
+Nested trial snapshots flatten the original base and ordered changes once.
+Independent after-deltas update existing keys without an after-state clone,
+while minimum snapshots, failed-trial rollback and enclosing guards remain.
+Input-batch lookahead itself never records virtual-stock reads: an unused
+later sub-unit alternative must not block otherwise valid periodic replay.
+Reached sub-unit candidates still establish exact replenishment guards.
+These changes reduce deterministic scratch work; production timings must be
+measured separately with fixed inventory, patterns and order quantity.
+
 The hooked native CraftingService now shares immutable registered pattern
 metadata between orders, keyed by grid/server/provider epoch/recipe epoch.
 Cold metadata is built in 2 ms / 32-entry slices; unchanged native processing
