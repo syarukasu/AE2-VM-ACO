@@ -234,7 +234,7 @@ final class VmInstructionExecution {
                     var key = candidate.key();
                     if (optimizedGuards && state.amount(key).compareTo(candidate.unit()) < 0) {
                         // Keep the guard when this skip is actually needed: later returns can replenish it.
-                        state.read(key, candidate.unit());
+                        state.read(key, candidate.unit(), true);
                         continue;
                     }
                     if (node.input instanceof PatternCompiler.DetachedInput detached && !detached.isCandidatePrepared(key))
@@ -518,10 +518,13 @@ final class VmInstructionExecution {
             copy.add(key, 1); keys.put(family, copy);
         }
         BigInteger read(AEKey key, BigInteger requested) {
+            return read(key, requested, false);
+        }
+        BigInteger read(AEKey key, BigInteger requested, boolean belowUnit) {
             var available = amount(key);
             if (stock.putIfAbsent(key, available) == null) stockKeyVersion = new Object();
             index(key);
-            for (var trace : traces) trace.read(key, available, requested, this);
+            for (var trace : traces) trace.read(key, available, requested, belowUnit);
             return available;
         }
         BigInteger extract(AEKey key, BigInteger requested) {
@@ -553,10 +556,14 @@ final class VmInstructionExecution {
             minimumSnapshots++;
             minimum = VmBranchMap.snapshot(state.lows.get(this));
         }
-        void read(AEKey key, BigInteger available, BigInteger requested, State current) {
+        void read(AEKey key, BigInteger available, BigInteger requested, boolean belowUnit) {
             var start = before.amount(key);
             var offset = available.subtract(start);
-            if (available.compareTo(requested) >= 0) {
+            if (belowUnit) {
+                // #218: zero consumption is invariant throughout [0, unit), not at one exact quantity.
+                lower.merge(key, offset.negate(), BigInteger::max);
+                upper.merge(key, requested.subtract(ONE).subtract(offset), BigInteger::min);
+            } else if (available.compareTo(requested) >= 0) {
                 lower.merge(key, requested.subtract(offset), BigInteger::max);
             } else {
                 lower.merge(key, start, BigInteger::max);
