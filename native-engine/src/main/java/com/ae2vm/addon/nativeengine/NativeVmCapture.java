@@ -178,7 +178,7 @@ final class NativeVmCapture {
             return primary.valid() && primary.remainder() == null ? templates[0].what() : null;
         }
         public void prepareCandidates(java.util.Collection<AEKey> keys) {
-            if (exactKey() != null) return;
+            if (nativeExact) return;
             var pending = new java.util.LinkedHashSet<Query>();
             for (var key : keys) {
                 var query = new Query(slot, key);
@@ -186,12 +186,14 @@ final class NativeVmCapture {
             }
             prepareQueries(new ArrayList<>(pending));
         }
-        public boolean isCandidatePrepared(AEKey key) { return observations.containsKey(new Query(slot, key)); }
+        public boolean isCandidatePrepared(AEKey key) { return nativeExact || observations.containsKey(new Query(slot, key)); }
         public boolean isValid(AEKey key, Level ignored) {
-            if (exactKey() != null) return key.matches(templates[0]);
+            if (nativeExact) return key.matches(templates[0]) && observe(slot, key).valid();
             return observe(slot, key).valid();
         }
-        public AEKey getRemainingKey(AEKey key) { return exactKey() != null ? null : observe(slot, key).remainder(); }
+        public AEKey getRemainingKey(AEKey key) {
+            return nativeExact && !key.matches(templates[0]) ? null : observe(slot, key).remainder();
+        }
     }
     private record FrozenPattern(AEItemKey definition, IPatternDetails.IInput[] inputs, GenericStack[] outputs)
             implements PatternCompiler.DetachedPattern {
@@ -327,7 +329,7 @@ final class NativeVmCapture {
             var crafted = selectCrafted(source, shape.templates());
             var input = new FrozenInput(identity, templates, shape.multiplier(),
                     crafted, patternGrid.getCraftingService().canEmitFor(templates[0].what()),
-                    nativeExactInput(source, templates.length));
+                    nativeExactInput(pattern, source, templates.length));
             capturedInputs.put(identity, input);
             slots[slot] = input;
             capturedQueries.add(new Query(identity, templates[0].what()));
@@ -483,7 +485,8 @@ final class NativeVmCapture {
                 && !sharedNativePatterns.contains(entry.getKey().id())) checks.add(() -> {
             var actual = patterns.get(entry.getKey().id()).pattern().getInputs()[entry.getKey().index()];
             var expected = entry.getValue();
-            if ((expected.nativeExact && !nativeExactInput(actual, actual.getPossibleInputs().length))
+            if ((expected.nativeExact && !nativeExactInput(patterns.get(entry.getKey().id()).pattern(),
+                    actual, actual.getPossibleInputs().length))
                     || !Objects.equals(expected.craftedKey(), selectCrafted(actual, List.of(expected.templates)))
                     || expected.emittable() != patternGrid.getCraftingService().canEmitFor(expected.templates[0].what()))
                 throw new NativeVm.Changed("input selection changed");
@@ -572,8 +575,13 @@ final class NativeVmCapture {
         return new Shape(List.copyOf(inputs), outputs);
     }
 
-    private static boolean nativeExactInput(IPatternDetails.IInput input, int templates) {
-        return templates == 1 && input.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input");
+    private static boolean nativeExactInput(IPatternDetails pattern, IPatternDetails.IInput input, int templates) {
+        if (templates != 1) return false;
+        if (input.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input")) return true;
+        // #218: only the pinned native implementation rejects every non-primary key without a recipe callback.
+        return pattern.getClass() == appeng.crafting.pattern.AECraftingPattern.class
+                && !((appeng.crafting.pattern.AECraftingPattern) pattern).canSubstitute()
+                && input.getClass().getName().equals("appeng.crafting.pattern.AECraftingPattern$Input");
     }
 
     private static void bounded(int count) {

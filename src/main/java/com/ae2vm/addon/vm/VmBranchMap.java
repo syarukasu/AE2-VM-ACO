@@ -41,9 +41,12 @@ final class VmBranchMap<K, V> extends AbstractMap<K, V> {
     static <K, V> void copyInto(Map<K, V> source, Map<K, V> target) {
         // #218: flatten once, not one full ancestor snapshot per nested trial.
         var layers = new ArrayDeque<Map<K, V>>();
-        while (source instanceof VmBranchMap<K, V> branch) {
-            layers.addFirst(branch.changes);
-            source = branch.parent;
+        while (true) {
+            if (source instanceof VmJournalMap<K, V> journal) source = journal.backing();
+            else if (source instanceof VmBranchMap<K, V> branch) {
+                layers.addFirst(branch.changes);
+                source = branch.parent;
+            } else break;
         }
         target.putAll(source);
         for (var changes : layers) target.putAll(changes);

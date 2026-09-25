@@ -428,31 +428,44 @@ final class VmInstructionExecution {
         private Object stockKeyVersion = EMPTY_STOCK_KEYS;
         VmByteCost bytes = VmByteCost.ZERO;
         State() {
-            stock = new LinkedHashMap<>(); used = new LinkedHashMap<>(); emitted = new LinkedHashMap<>();
-            missing = new LinkedHashMap<>(); patterns = new LinkedHashMap<>(); keys = new HashMap<>();
+            stock = new VmJournalMap<>(); used = new VmJournalMap<>(); emitted = new VmJournalMap<>();
+            missing = new VmJournalMap<>(); patterns = new VmJournalMap<>(); keys = new HashMap<>();
         }
         State(State parent) {
-            stock = new VmBranchMap<>(parent.stock); used = new VmBranchMap<>(parent.used);
-            emitted = new VmBranchMap<>(parent.emitted); missing = new VmBranchMap<>(parent.missing);
-            patterns = new VmBranchMap<>(parent.patterns); keys = new VmBranchMap<>(parent.keys);
+            stock = new VmJournalMap<>(new VmBranchMap<>(parent.stock));
+            used = new VmJournalMap<>(new VmBranchMap<>(parent.used));
+            emitted = new VmJournalMap<>(new VmBranchMap<>(parent.emitted));
+            missing = new VmJournalMap<>(new VmBranchMap<>(parent.missing));
+            patterns = new VmJournalMap<>(new VmBranchMap<>(parent.patterns)); keys = new VmBranchMap<>(parent.keys);
             parent.lows.forEach((trace, low) -> lows.put(trace, new VmBranchMap<>(low)));
             stockKeyVersion = parent.stockKeyVersion; bytes = parent.bytes;
         }
+        State(State source, boolean checkpoint) {
+            stock = ((VmJournalMap<AEKey, BigInteger>) source.stock).snapshot();
+            emitted = ((VmJournalMap<AEKey, BigInteger>) source.emitted).snapshot();
+            missing = ((VmJournalMap<AEKey, BigInteger>) source.missing).snapshot();
+            patterns = ((VmJournalMap<IPatternDetails, BigInteger>) source.patterns).snapshot();
+            used = Map.of(); keys = Map.of();
+            stockKeyVersion = source.stockKeyVersion; bytes = source.bytes;
+        }
         long changedEntries() {
             long count = 0;
-            for (var map : List.of(stock, used, emitted, missing, patterns, keys))
-                count += ((VmBranchMap<?, ?>) map).changedEntries();
+            for (var map : List.of(stock, used, emitted, missing, patterns))
+                count += ((VmJournalMap<?, ?>) map).changedEntries();
+            count += ((VmBranchMap<?, ?>) keys).changedEntries();
             for (var map : lows.values()) count += ((VmBranchMap<?, ?>) map).changedEntries();
             return count;
         }
         void commitTo(State parent) {
-            for (var map : List.of(stock, used, emitted, missing, patterns, keys)) ((VmBranchMap<?, ?>) map).commit();
+            for (var map : List.of(stock, used, emitted, missing, patterns)) ((VmJournalMap<?, ?>) map).commit();
+            ((VmBranchMap<?, ?>) keys).commit();
             // Child traces have finished; only inherited low-water maps survive here.
             for (var map : lows.values()) ((VmBranchMap<?, ?>) map).commit();
             parent.stockKeyVersion = stockKeyVersion; parent.bytes = bytes;
         }
         State copy() { stateCopies++; var copy = new State(); copy.adopt(this); return copy; }
         State replayCopy() {
+            if (sparseBranches) return new State(this, true);
             // #218: replay reads these quantities only, never copied low-water maps, used counts or fuzzy indexes.
             stateCopies++;
             var copy = new State();
@@ -460,6 +473,10 @@ final class VmInstructionExecution {
             replace(copy.missing, missing); replace(copy.patterns, patterns);
             copy.stockKeyVersion = stockKeyVersion; copy.bytes = bytes;
             return copy;
+        }
+        void closeCheckpoint() {
+            for (var map : List.of(stock, emitted, missing, patterns))
+                if (map instanceof VmJournalMap.Snapshot<?, ?> snapshot) snapshot.close();
         }
         long entries() {
             return (long) stock.size() + used.size() + emitted.size() + missing.size() + patterns.size()
@@ -472,7 +489,10 @@ final class VmInstructionExecution {
             lows.clear(); other.lows.forEach((trace, low) -> lows.put(trace, VmBranchMap.snapshot(low)));
             keys.clear(); VmBranchMap.copyInto(other.keys, keys); bytes = other.bytes;
         }
-        BigInteger amount(AEKey key) { return stock.getOrDefault(key, initial.getOrDefault(key, ZERO)); }
+        BigInteger amount(AEKey key) {
+            var value = stock.get(key);
+            return value != null ? value : initial.getOrDefault(key, ZERO);
+        }
         boolean sameStockKeys(State other) {
             // #217: identity proves membership equality, not quantity equality. Branches inherit, never increment, tokens.
             if (stockKeyVersion == other.stockKeyVersion) return true;
@@ -508,7 +528,7 @@ final class VmInstructionExecution {
             var taken = read(key, requested).min(requested);
             var left = amount(key).subtract(taken);
             putStock(key, left); index(key);
-            lows.values().forEach(low -> low.merge(key, left, BigInteger::min));
+            lows.forEach((trace, low) -> low.merge(key, left.min(trace.before.amount(key)), BigInteger::min));
             var required = initial.getOrDefault(key, ZERO).subtract(left);
             if (required.signum() > 0) used.merge(key, required, BigInteger::max);
             return taken;
@@ -526,9 +546,9 @@ final class VmInstructionExecution {
         Map<AEKey, BigInteger> minimum;
         Trace(State state) {
             before = state.replayCopy();
-            state.lows.put(this, VmBranchMap.snapshot(state.stock));
+            state.lows.put(this, sparseBranches ? new LinkedHashMap<>() : VmBranchMap.snapshot(state.stock));
         }
-        void finish(State state) { minimum = state.lows.remove(this); }
+        void finish(State state) { minimum = state.lows.remove(this); before.closeCheckpoint(); }
         void captureMinimum(State state) {
             minimumSnapshots++;
             minimum = VmBranchMap.snapshot(state.lows.get(this));
@@ -569,8 +589,14 @@ final class VmInstructionExecution {
                 if (max != null) parent.upper.merge(key,
                         max.subtract(offset).subtract(delta.max(ZERO).multiply(repeats)), BigInteger::min);
             }
-            // Existing-key deltas are independent; keep the minimum snapshot separate, not the entire after-state.
-            for (var key : state.stock.keySet()) {
+            Collection<AEKey> changed;
+            if (before.stock instanceof VmJournalMap.Snapshot<AEKey, BigInteger> snapshot) {
+                // #218: a committed catalyst can have zero net change but a nonzero reservation peak.
+                var keys = new LinkedHashSet<>(snapshot.changedKeys());
+                keys.addAll(minimum.keySet());
+                changed = keys;
+            } else changed = state.stock.keySet();
+            for (var key : changed) {
                 var delta = state.amount(key).subtract(before.amount(key));
                 state.putStock(key, state.stock.get(key).add(delta.multiply(repeats)));
                 var low = minimum.getOrDefault(key, before.amount(key));
@@ -591,11 +617,15 @@ final class VmInstructionExecution {
         if (value.signum() != 0) map.merge(key, value, BigInteger::add);
     }
     private static <K> void replace(Map<K, BigInteger> target, Map<K, BigInteger> source) {
-        target.clear(); VmBranchMap.copyInto(source, target);
+        // VM ledgers only grow: a successful child contains every key of its parent.
+        VmBranchMap.copyInto(source, target);
     }
     private static <K> void scaleDelta(Map<K, BigInteger> target, Map<K, BigInteger> before,
             BigInteger repeats) {
-        target.forEach((key, value) -> merge(target, key, value.subtract(before.getOrDefault(key, ZERO)).multiply(repeats)));
+        if (before instanceof VmJournalMap.Snapshot<K, BigInteger> snapshot) {
+            for (var key : snapshot.changedKeys())
+                merge(target, key, target.get(key).subtract(before.getOrDefault(key, ZERO)).multiply(repeats));
+        } else target.forEach((key, value) -> merge(target, key, value.subtract(before.getOrDefault(key, ZERO)).multiply(repeats)));
     }
     private static void checkpoint() {
         if (Thread.currentThread().isInterrupted()) throw new CancellationException("VM calculation cancelled");

@@ -32,11 +32,14 @@ back their quantities without discarding the observations used for replay
 guards. Pattern bytecode is compiled once per captured request scope; no
 stock-dependent plan is shared between requests.
 
-Replay before-snapshots contain only quantities and metadata used by replay;
-they do not clone enclosing low-water maps, used-item maps or fuzzy indexes.
-Nested trial snapshots flatten the original base and ordered changes once.
-Independent after-deltas update existing keys without an after-state clone,
-while minimum snapshots, failed-trial rollback and enclosing guards remain.
+Replay before-state uses scoped before-value journals. Opening a checkpoint
+does not traverse stock or pattern counts: writes remember each changed key's
+original value once. Child trials do not write into parent journals until commit.
+Replay scales only changed quantities and extracted minima, including catalysts
+with zero net change. Closed scopes release their history. Low-water maps are
+sparse; failed-trial rollback and enclosing guards remain exact. Diagnostic
+stateCopies counts actual full state copies, not these lazy checkpoints.
+Explicit full snapshots flatten journal-wrapped trial layers only once.
 Input-batch lookahead itself never records virtual-stock reads: an unused
 later sub-unit alternative must not block otherwise valid periodic replay.
 Reached sub-unit candidates still establish exact replenishment guards.
@@ -80,6 +83,15 @@ if the VM consults that candidate; cancellation, epoch changes and fatal errors
 remain immediate. Stock-proof and retained-data limits are not deferred.
 Unobserved variants are never assumed equivalent. Cancellation stays latched
 even after a worker clears its interrupt. Actual retained-data safeguards remain.
+
+Non-substituting native AECraftingPattern inputs also use captured exact-key
+semantics. The proof requires the native outer class, native Input class and
+disabled item substitution, not just a one-template array. Primary remainders
+remain captured and revalidated; substitutions and unknown callbacks remain
+server-owned. Fixed crafting without returns can participate in the existing
+shared-demand programs. A 2048-wrong-NBT fixture reduces total handoffs from
+156 to 5 (83 INPUTS to zero); this is local operation-count evidence, not a
+measured production speedup or a claim that all dynamic handoffs are removed.
 
 ## Build and Test
 
