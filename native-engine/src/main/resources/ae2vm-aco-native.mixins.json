@@ -3,6 +3,6 @@
   "minVersion": "0.8",
   "package": "com.ae2vm.addon.nativeengine.mixin",
   "compatibilityLevel": "JAVA_17",
-  "mixins": ["NativeCraftingServiceMixin"],
+  "mixins": ["NativeCraftingServiceMixin", "CraftingCalculationControl"],
   "injectors": {"defaultRequire": 1}
 }

@@ -15,6 +15,13 @@ final class NativeVmTiming {
     private long otherPatternTypes;
     private long queued, server, blocked, handoffs, vmActive;
     private long copies, branchTrials, branchEntries, aggregatedBlocks;
+    private boolean ae2Scheduled;
+    private long cpuStarted = -1;
+
+    void ae2Scheduled() {
+        ae2Scheduled = true;
+        cpuStarted = java.lang.management.ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime();
+    }
 
     NativeVmTiming() { this(System::nanoTime); }
     NativeVmTiming(LongSupplier clock) { this.clock = clock; }
@@ -81,7 +88,10 @@ final class NativeVmTiming {
         return "stockMs=" + ms(phases[Phase.STOCK.ordinal()])
                 + " prepareMs=" + ms(phases[Phase.PREPARE.ordinal()])
                 + " vmMs=" + ms(phases[Phase.VM.ordinal()])
-                + " vmActiveMs=" + ms(vmActive)
+                + " vmActiveMs=" + (ae2Scheduled ? -1 : ms(vmActive))
+                + " vmCpuMs=" + (cpuStarted < 0 ? -1 : ms(Math.max(0,
+                        java.lang.management.ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime() - cpuStarted)))
+                + " scheduler=" + (ae2Scheduled ? "ae2" : "detached")
                 + " validateMs=" + ms(phases[Phase.VALIDATE.ordinal()])
                 + " finalizeMs=" + ms(phases[Phase.FINALIZE.ordinal()])
                 + " serverQueueMs=" + ms(queued) + " serverWorkMs=" + ms(server)

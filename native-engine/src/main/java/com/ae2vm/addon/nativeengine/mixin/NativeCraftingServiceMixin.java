@@ -15,13 +15,15 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 /** The fork owns the native request entry, not an ACO pattern adapter. */
 @Mixin(value = CraftingService.class, remap = false, priority = 2000)
 public abstract class NativeCraftingServiceMixin implements com.ae2vm.addon.nativeengine.NativeVmHook {
     @Shadow @Final private IGrid grid;
+    @Shadow @Final private static java.util.concurrent.ExecutorService CRAFTING_POOL;
+
+    @Override public void vm$execute(Runnable calculation) { CRAFTING_POOL.execute(calculation); }
 
     @Inject(method = "beginCraftingCalculation", at = @At("HEAD"), cancellable = true, require = 1)
     private void vm$calculate(Level level, ICraftingSimulationRequester requester, AEKey output,
@@ -30,16 +32,4 @@ public abstract class NativeCraftingServiceMixin implements com.ae2vm.addon.nati
         cir.setReturnValue(NativeVm.calculate(grid, level, requester, output, BigInteger.valueOf(amount), strategy));
     }
 
-    @Inject(method = {"refreshNodeCraftingProvider", "removeNode"}, at = @At("TAIL"), require = 1)
-    private void vm$changed(appeng.api.networking.IGridNode node, CallbackInfo ci) {
-        if (node.getService(appeng.api.networking.crafting.ICraftingProvider.class) != null)
-            NativeVm.patternsChanged(grid);
-    }
-
-    @Inject(method = "addNode", at = @At("TAIL"), require = 1)
-    private void vm$added(appeng.api.networking.IGridNode node, net.minecraft.nbt.CompoundTag savedData, CallbackInfo ci) {
-        // #218: initial provider registration also invalidates cached missing producers.
-        if (node.getService(appeng.api.networking.crafting.ICraftingProvider.class) != null)
-            NativeVm.patternsChanged(grid);
-    }
 }

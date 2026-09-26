@@ -11,38 +11,27 @@ import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
 import com.mojang.logging.LogUtils;
 import java.math.BigInteger;
-import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
-import java.util.WeakHashMap;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.FutureTask;
-import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.Level;
 import org.slf4j.Logger;
 
-/** Native VM request owner. No dependency on ACO's graph/planner/capture classes. */
+/** VM arithmetic under AE2's own lifecycle. No detached capture or retry layer. */
 public final class NativeVm {
     private static final Logger LOG = LogUtils.getLogger();
     private static final NativeVmDiagnostics DIAGNOSTICS = new NativeVmDiagnostics(LOG, System::nanoTime,
             Boolean.getBoolean("ae2vm.diagnostics.verbose"));
-    private static final Map<IGrid, Long> EPOCHS = Collections.synchronizedMap(new WeakHashMap<>());
-    private static final AtomicLong RECIPES = new AtomicLong();
     private static final AtomicLong ORDERS = new AtomicLong();
     private static final Map<FutureTask<?>, MinecraftServer> ACTIVE = new ConcurrentHashMap<>();
-    private static final ThreadPoolExecutor WORKERS = new ThreadPoolExecutor(2, 2, 30, TimeUnit.SECONDS,
-            new ArrayBlockingQueue<>(128), task -> {
-                var thread = new Thread(task, "AE2 VM Calculator");
-                thread.setDaemon(true);
-                return thread;
-            }, new ThreadPoolExecutor.AbortPolicy());
     private static volatile VmAccounting accounting;
     private NativeVm() { }
 
@@ -61,17 +50,8 @@ public final class NativeVm {
         accounting = Objects.requireNonNull(extension);
     }
 
-    public static long epoch(IGrid grid) { return EPOCHS.getOrDefault(grid, 0L); }
-    public static long recipeEpoch() { return RECIPES.get(); }
-    public static void recipesChanged() { RECIPES.incrementAndGet(); NativeVmPatternCatalog.recipesChanged(); }
-    public static void patternsChanged(IGrid grid) {
-        EPOCHS.merge(grid, 1L, Long::sum);
-        NativeVmPatternCatalog.invalidate(grid);
-    }
     public static void cancelServer(MinecraftServer server) {
         ACTIVE.forEach((future, owner) -> { if (owner == server) future.cancel(true); });
-        WORKERS.purge();
-        NativeVmPatternCatalog.stop(server);
     }
 
     public static Future<ICraftingPlan> calculate(IGrid grid, Level level,
@@ -80,84 +60,103 @@ public final class NativeVm {
         Objects.requireNonNull(output); Objects.requireNonNull(requested);
         var server = Objects.requireNonNull(level.getServer());
         if (requested.signum() <= 0) throw new IllegalArgumentException("positive VM order required");
-        long order = ORDERS.incrementAndGet();
-        FutureTask<ICraftingPlan> task = new FutureTask<>(() -> compute(order, grid, level, requester, output, requested, strategy)) {
+        long order = ORDERS.incrementAndGet(), started = System.nanoTime();
+        var job = new AtomicReference<NativeVmCalculation>();
+        class OrderTask extends FutureTask<ICraftingPlan> {
+            OrderTask() { super(() -> job.get().run()); }
             @Override protected void done() { ACTIVE.remove(this); }
-        };
+            void fail(Throwable failure) { setException(failure); }
+        }
+        var task = new OrderTask();
         ACTIVE.put(task, server);
-        try { WORKERS.execute(task); }
-        catch (RuntimeException failure) { ACTIVE.remove(task); task.cancel(false); throw failure; }
+        Runnable initialize = () -> {
+            if (task.isCancelled()) return;
+            try {
+                if (server.isStopped()) throw new CancellationException("server stopped");
+                var hook = (NativeVmHook) grid.getCraftingService();
+                var timing = new NativeVmTiming();
+                var extension = accounting;
+                VmAccounting.Stock stock;
+                try (var span = timing.phase(NativeVmTiming.Phase.STOCK)) {
+                    stock = requestStock(grid, requester, extension);
+                }
+                if (task.isCancelled()) return;
+                job.set(new NativeVmCalculation(level, grid, output, strategy,
+                        checkpoint -> compute(order, started, grid, level, requester, output, requested,
+                                strategy, extension, stock, timing, checkpoint)));
+                hook.vm$execute(task);
+            } catch (Throwable failure) { task.fail(failure); }
+        };
+        // Off-thread API callers queue creation once, never one task per ingredient.
+        if (server.isSameThread()) initialize.run();
+        else try { server.execute(initialize); }
+        catch (RuntimeException failure) { task.fail(failure); }
         return task;
     }
 
-    private static ICraftingPlan compute(long order, IGrid grid, Level level, ICraftingSimulationRequester requester, AEKey output,
-            BigInteger request, CalculationStrategy strategy) {
-        long started = System.nanoTime();
-        var timing = new NativeVmTiming();
-        DIAGNOSTICS.started();
-        if (DIAGNOSTICS.verbose())
-            LOG.debug("AE2-VM event=started order={} output={} requested={} owner=vm-native", order, output.getId(), request);
-        try {
-            for (int attempt = 0; ; attempt++) {
-                try {
-                    VmAccounting extension = accounting;
-                    var capture = new NativeVmCapture(grid, level, extension, work -> DIAGNOSTICS.running(
-                            order, output.getId(), work, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)), timing, requester);
-                    var result = capture.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS);
-                    var bindings = capture.bindings();
-                    BigInteger bytes = bytes(result);
-                    boolean wide = result.requested().bitLength() > 63
-                            || wide(result.crafts()) || wide(result.used()) || wide(result.missing()) || wide(result.emitted());
-                    // Even a long execution count can overflow AE2's output multiplication.
-                    wide |= capture.widePendingOutputs(result.crafts());
-                    var exact = new NativeVmResult(result, bindings, bytes, wide);
-                    capture.validate();
-                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantities_ready order={} patterns={} usedKeys={} missingKeys={} wide={} elapsedMs={}",
-                            order, result.crafts().size(), result.used().size(), result.missing().size(), exact.wide(),
-                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-                    ICraftingPlan plan;
-                    try (var span = timing.phase(NativeVmTiming.Phase.FINALIZE)) {
-                    plan = capture.callServer(NativeVmTiming.ServerCall.FINALIZE, () -> {
-                        if (exact.wide()) {
-                            if (extension == null) throw new IllegalStateException("wide VM result requires an exact accounting owner");
-                            return extension.wideResult(grid, level, exact);
-                        }
-                        return ordinaryPlan(exact);
-                    });
-                    }
-                    String profile = timing.summary();
-                    DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation() ? "missing" : "ready", profile));
-                    DIAGNOSTICS.completed(order, output.getId(), request,
-                            TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), plan.simulation(), profile);
-                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} output={} requested={} "
-                                    + "instructions={} work={} skipped={} simulation={} elapsedMs={}",
-                            order, output.getId(), result.requested(), result.instructions(), result.work(),
-                            result.skippedIterations(), plan.simulation(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
-                    return plan;
-                } catch (Changed changed) {
-                    DIAGNOSTICS.recaptured();
-                    if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=recapture order={} reason={}", order, changed.getMessage());
-                    try { TimeUnit.MILLISECONDS.sleep(50L << Math.min(attempt, 4)); }
-                    catch (InterruptedException interrupted) {
-                        Thread.currentThread().interrupt();
-                        throw new CancellationException("VM recapture cancelled");
-                    }
+    static VmAccounting.Stock requestStock(IGrid grid, ICraftingSimulationRequester requester, VmAccounting extension) {
+        var source = requester.getActionSource();
+        if (source == null) return new VmAccounting.Stock(Map.of(), true, java.util.Set.of());
+        VmAccounting owner = extension != null ? extension : new VmAccounting() {
+            public BigInteger maximumCount() { return BigInteger.valueOf(Long.MAX_VALUE); }
+            public Stock exactStock(IGrid value) {
+                Map<AEKey, BigInteger> amounts = new LinkedHashMap<>();
+                for (var entry : value.getStorageService().getCachedInventory()) {
+                    if (entry.getLongValue() < 0) throw new IllegalArgumentException("negative AE2 stock");
+                    if (entry.getLongValue() > 0) amounts.put(entry.getKey(), BigInteger.valueOf(entry.getLongValue()));
                 }
+                return new Stock(amounts, true, amounts.keySet());
             }
+            public ICraftingPlan wideResult(IGrid value, Level world, NativeVmResult result) {
+                throw new IllegalStateException("wide result requires an exact accounting owner");
+            }
+        };
+        var config = appeng.core.AEConfig.instance();
+        return owner.requestStock(grid, source, config != null && config.isCraftingSimulatedExtraction());
+    }
+
+    static ICraftingPlan compute(long order, long started, IGrid grid, Level level,
+            ICraftingSimulationRequester requester, AEKey output, BigInteger request, CalculationStrategy strategy,
+            VmAccounting extension, VmAccounting.Stock stock, NativeVmTiming timing, Runnable checkpoint) {
+        DIAGNOSTICS.started();
+        timing.ae2Scheduled();
+        try {
+            var context = new NativeVmPlanningContext(grid, level, requester, stock, checkpoint, timing);
+            var result = context.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS,
+                    work -> DIAGNOSTICS.running(order, output.getId(), work, elapsed(started)));
+            BigInteger bytes = bytes(result);
+            boolean wide = result.requested().bitLength() > 63
+                    || wide(result.crafts()) || wide(result.used()) || wide(result.missing()) || wide(result.emitted())
+                    || context.widePendingOutputs(result.crafts());
+            var exact = new NativeVmResult(result, context.bindings(), bytes, wide);
+            ICraftingPlan plan;
+            try (var span = timing.phase(NativeVmTiming.Phase.FINALIZE)) {
+                if (exact.wide()) {
+                    if (extension == null) throw new IllegalStateException("wide VM result requires an exact accounting owner");
+                    plan = extension.wideResult(grid, level, exact);
+                } else plan = ordinaryPlan(exact);
+            }
+            String profile = timing.summary();
+            DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
+                    elapsed(started), plan.simulation() ? "missing" : "ready", profile));
+            DIAGNOSTICS.completed(order, output.getId(), request, elapsed(started), plan.simulation(), profile);
+            if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} "
+                    + "output={} requested={} scheduler=ae2 {}", order, output.getId(), request, profile);
+            return plan;
         } catch (CancellationException cancelled) {
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "cancelled", timing.summary()));
+                    elapsed(started), "cancelled", timing.summary()));
             DIAGNOSTICS.cancelled();
-            if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=cancelled order={}", order);
             throw cancelled;
         } catch (RuntimeException failure) {
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                    TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started), "failed", timing.summary()));
+                    elapsed(started), "failed", timing.summary()));
             DIAGNOSTICS.failed(order, output.getId(), request, failure);
             throw failure;
         }
     }
+
+    private static long elapsed(long started) { return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started); }
 
     private static boolean wide(Map<?, BigInteger> values) { return values.values().stream().anyMatch(v -> v.bitLength() > 63); }
 
@@ -193,7 +192,4 @@ public final class NativeVm {
         return numerator.signum() == 0 ? whole : whole.add(BigInteger.ONE);
     }
 
-    static final class Changed extends RuntimeException {
-        Changed(String detail) { super(detail); }
-    }
 }

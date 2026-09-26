@@ -1,166 +1,69 @@
 # Native Forge VM Integration
 
-This module owns the AE2 1.20.1 crafting-calculation entry. It reads patterns and
-input semantics through AE2 on the server thread and runs immutable BigInteger
-bytecode calculations on bounded, cancellable worker threads. It does not
-depend on ACO graph/capture classes. VmAccounting is the optional exact-stock
-and finished-wide-result contract.
+This module replaces the AE2 1.20.1 calculation engine with the BigInteger VM.
+AE2 retains its calculation thread pool, TickHandler registration, cooperative
+simulateFor/handlePausing time slices and finish/cancellation protocol.
+The server waits during each AE2 calculation slice. This is not detached,
+unlimited background work and is not a zero-server-cost claim.
 
-The upstream compiler/stack-bytecode core is compiled into this native JAR.
-Shared exact-input demands are again combined as compiled programs rather than
-expanded once per recipe path. Their coefficients, net outputs and byte charges
-are BigInteger/rational values. Only already-demanded definitions and prepared
-input semantics enter compilation. Unqueried producers remain stock-only
-boundaries until the VM actually needs to craft them; no eager capture is added.
-AE2's conceptual tree-node capacity is computed from compact shapes without
-allocating the equivalent tree. Ordinary stock changes are not recapture events.
+## Request Path
 
-The original unconditional one-craft aggregation is not restored for stateful
-inputs. Alternatives, returned tools, internally consumed byproducts, cycles,
-non-whole batch ratios and stocked intermediates retain ordered instructions
-inside the same VM; this does not fall back to ACO or AE2's calculator. This is a semantic extension of
-the VM, not a claim that upstream's original aggregation was correct for every
-AE2 recipe. The copied rc.4 `ExactBranchVM` evaluator is removed. The upstream
-mod bootstrap, blocklist, config and mixins are not included; this module owns
-the controlled AE2 entry. ACO supplies stock/result accounting only.
+1. Create the job on the server thread and capture accessible exact stock once.
+   Off-thread API callers enqueue creation once. Cancellation before creation is latched.
+2. Schedule NativeVmCalculation on AE2's own CRAFTING_POOL.
+3. Inside AE2's exclusive calculation interval, NativeVmPlanningContext passes
+   provider order and actual input predicates/returns to the VM. It compiles only
+   demanded definitions in a request-local scope.
+4. Return an ordinary AE2 plan or the VmAccounting BigInteger result.
+   The base calculation's placeholder long quantity is never used for arithmetic.
+5. AE2/AQE still owns submission, live reservation, physical execution and refunds.
 
-The quantity stack, scratch inventory, operation counts, missing amounts,
-returns and rational byte charges use BigInteger. A replay verifies every
-inventory comparison over the skipped interval, preserves peak reservation,
-and accounts for periodic damaged-tool states. Failed producer trials roll
-back their quantities without discarding the observations used for replay
-guards. Pattern bytecode is compiled once per captured request scope; no
-stock-dependent plan is shared between requests.
+NativeVmCapture and NativeVmPatternCatalog are not shipped. There are no
+ingredient server futures, full-grid prefetch, observation mirrors, whole-plan
+adoption checks, recapture/backoff loops or second calculation worker pool.
+Historical detached-capture regression fixtures exist only in the ACO test tree.
+They are not production fallbacks or evidence of the current integration.
 
-Replay before-state uses scoped before-value journals. Opening a checkpoint
-does not traverse stock or pattern counts: writes remember each changed key's
-original value once. Child trials do not write into parent journals until commit.
-Replay scales only changed quantities and extracted minima, including catalysts
-with zero net change. Closed scopes release their history. Low-water maps are
-sparse; failed-trial rollback and enclosing guards remain exact. Diagnostic
-stateCopies counts actual full state copies, not these lazy checkpoints.
-Explicit full snapshots flatten journal-wrapped trial layers only once.
-Input-batch lookahead itself never records virtual-stock reads: an unused
-later sub-unit alternative must not block otherwise valid periodic replay.
-Reached sub-unit candidates still establish exact replenishment guards.
-These changes reduce deterministic scratch work; production timings must be
-measured separately with fixed inventory, patterns and order quantity.
+The quantity stack, scratch stock, execution counts, missing/used/emitted items,
+returns and byte charges use BigInteger. Shared exact demands use compiled
+programs; alternatives and stateful branches retain ordered VM instructions.
+The existing exact arithmetic/replay guards preserve quantities, not a timeout
+or long-clipping policy. No stock-dependent plan is shared between orders.
+Stock provenance, interruption and real CPU submission checks remain.
 
-The hooked native CraftingService now shares immutable registered pattern
-metadata between orders, keyed by grid/server/provider epoch/recipe epoch.
-Cold metadata is built in 2 ms / 32-entry slices; unchanged native processing
-patterns require no server handoff during VM execution, followed by one final
-version check. Retention is capped at 16 grids and 65,536 keys/candidate entries
-per grid and cleared on provider changes, recipe reload and server stop.
-Stock, virtual inventories, dynamic predicates and plans are never shared.
-Unknown callbacks are not invoked for unused catalog entries; only exact native
-processing semantics are worker-readable. Oversized catalogs and unhooked
-services use the existing bounded demand path with the same VM, not another
-planner. Snapshot setup/copying and individual callbacks are not preemptible.
-All timing claims require real measurements, including cold setup cost.
+## Build and Verification
 
-The fallback per-order catalog may prefetch single-producer native processing inputs
-inside the existing 2 ms / 32-pattern / 128-observation server slice. It stops
-at stocked intermediates, emitters, alternate/custom producers, or an incomplete
-stock proof. This is metadata only: unused prefetched patterns are not part of
-the adopted plan or its semantic validation set. Failed capture publishes no
-partial pattern, and cancellation is checked within capture work. A synthetic
-96-stage chain uses 19 server handoffs including validation instead of 112;
-this is an operation count, not an industrial-server speed measurement.
-
-Input shapes and primary rules are captured first. Other validity/return rules
-are acquired on demand, only for candidates encountered in the VM inventory,
-in server-owned batches of at most 128 checks / two milliseconds (a single
-callback cannot be preempted). Future returned damage states are not enumerated.
-Candidate batches span templates of the current input, preserving template/fuzzy
-priority and each template's unit. They never expand a future return or an unused
-recipe. A cached prefix is consumed before requesting an uncached batch, so a
-fully stocked primary keeps its zero-input-handoff path. A 384-single-candidate
-fixture uses 3 input handoffs instead of 383; this
-does not establish production wall-clock speed. Only consulted observations are
-revalidated before adoption. Speculative callback failures are retained and thrown
-if the VM consults that candidate; cancellation, epoch changes and fatal errors
-remain immediate. Stock-proof and retained-data limits are not deferred.
-Unobserved variants are never assumed equivalent. Cancellation stays latched
-even after a worker clears its interrupt. Actual retained-data safeguards remain.
-
-Non-substituting native AECraftingPattern inputs also use captured exact-key
-semantics. The proof requires the native outer class, native Input class and
-disabled item substitution, not just a one-template array. Primary remainders
-remain captured and revalidated; substitutions and unknown callbacks remain
-server-owned. Fixed crafting without returns can participate in the existing
-shared-demand programs. A 2048-wrong-NBT fixture reduces total handoffs from
-156 to 5 (83 INPUTS to zero); this is local operation-count evidence, not a
-measured production speedup or a claim that all dynamic handoffs are removed.
-
-## Build and Test
-
-The controlled Forge build is in the sibling ACO rc.4 recovery worktree:
+Build from the sibling ACO worktree with Java 17:
 
     ../../aco-rc4-vm/forge-1201
+    ./gradlew.bat test build runGameTestServer verifyExactVmBundle --no-daemon
+    ./gradlew.bat test build runGameTestServer verifyExactVmBundle -Pae2Variant=uelm --no-daemon
 
-Use Java 17 there:
+The quantity oracle harness tests the current production context against AE2.
+Forge GameTests exercise the mixed-in native lifecycle, direct callbacks while
+the server waits, cancellation, concurrent orders, stock changes and wide plans.
+The bundle audit rejects retired capture/catalog classes and verifies nested
+JAR bytes, bootstraps, class ownership and licenses. vmNativeSourcesJar supplies
+the corresponding sources. Do not use upstream root deployment tasks.
 
-    ./gradlew.bat test runGameTestServer verifyExactVmBundle --no-daemon
-    ./gradlew.bat test runGameTestServer -Pae2Variant=uelm --no-daemon
+## Diagnostics and Limits
 
-Override `acoExactVmDir` with the path to this fork's `exact-engine` directory
-when using a different checkout layout. That module's sibling `native-engine`
-is compiled independently of ACO's main sources. ACO compiles against its
-output; the native module never compiles against ACO classes.
+Default logging is bounded: activity summaries at most once per minute and
+slow/running details at most once per 30 seconds; failures remain explicit.
+Per-order DEBUG traces require -Dae2vm.diagnostics.verbose=true.
+The last 64 outcomes are available through /aco vm recent [1..64].
+scheduler=ae2 and handoffs=0 identify this lifecycle; vmMs includes AE2 waits,
+vmActiveMs=-1 avoids presenting waiting time as active work, and vmCpuMs is
+measured on the worker using the JVM thread CPU timer. These are calculation
+outcomes, not evidence of physical craft completion.
 
-`bundleVm` embeds the reobfuscated native mod and the tested arithmetic library
-with Forge Jar-in-Jar metadata. `verifyExactVmBundle` checks both nested
-artifacts, bootstrap manifests, class boundaries and licenses. Do not invoke
-the upstream root build/deployment tasks as a substitute.
-`vmNativeSourcesJar` creates the corresponding compiler, interpreter, adapter
-and resource source archive. Distribute it alongside a prerelease of the bundle.
+Pattern exploration follows AE2's current requester grid; already explored
+nodes are not invalidated and restarted. Stock is a snapshot, not a reservation.
+Ordinary results use longValueExact only after eligibility checks. Wide values
+remain exact in the accounting API; the legacy long interface is only a facade.
 
-## Diagnostics
-
-Routine orders do not produce individual INFO or DEBUG messages by default.
-Activity emits one INFO summary at most every 60 seconds: started/completed,
-missing plans, cancellations, failures, recaptures, slow completions, and
-mean/max completion milliseconds within that window. An idle VM has no timer
-thread and produces no periodic messages.
-
-Slow means at least five seconds. Running and slow-completion samples are
-each globally limited to one per 30 seconds across orders. Failure exceptions
-and stack traces remain ERROR and are not rate-limited. To investigate an
-individual order, explicitly enable per-order DEBUG traces with the Java
-argument `-Dae2vm.diagnostics.verbose=true` (and a logger accepting DEBUG).
-Changing the logger to DEBUG alone does not enable per-order traces.
-
-Existing timing summaries also include aggregatedBlocks, the number of applied
-shared-demand programs. No per-block log event is added.
-These diagnostics do not alter calculation, cancellation or exact accounting.
-
-The last 64 ready/missing/failed/cancelled calculations are retained without
-per-order logging. ACO exposes them to operators via `/aco vm recent [1..64]`.
-Samples contain the item ID, exact request, status and worker elapsed time
-(including capture waits, excluding time queued before worker execution).
-They do not prove physical craft completion or retain grid/world references.
-
-## Boundaries
-
-- Original AE2 candidate order, fuzzy input observations, container returns and
-  inventory snapshot semantics are compared with actual AE2 calculations.
-- Stock movement alone does not invalidate a completed snapshot. Submission
-  must reserve against current stock. Pattern/recipe changes are revalidated.
-- Exact input coefficients, branch counts, used/missing/emitted quantities and
-  requested quantities use BigInteger, without long clipping in the VM.
-- The existing AE2 interface still has long fields. Ordinary results are
-  narrowed with longValueExact only after eligibility checks. Wide results go
-  to the accounting extension, which preserves their exact counts separately.
-- Calculation completion is not proof of physical execution or recovery.
-
-## Consumer Boundary
-
-The ACO bridge publishes finished wide quantities independently of physical
-preparation. A stocked processing result must not fail calculation because a
-consumer only implements a crafting-table executor. Preparation and custody
-remain consumer responsibilities; successful calculation/API transfer is not
-proof that every external CPU supports wide processing, dynamic inputs or cycles.
-The existing ACO receipt executor still has those restrictions. The bridge does
-not substitute fake missing materials, synthesize output, or send projected
-long counts to a native executor to bypass them.
+Production wall-clock speed, the final creative-circuit <10-second target,
+generic wide machine/cycle execution and restart recovery are not established
+by the local calculation tests. Alternate-only container returns retain the
+existing AE2-compatible limitation; this lifecycle change does not repair that
+separate accounting case or claim complete industrial execution.

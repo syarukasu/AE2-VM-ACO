@@ -14,11 +14,11 @@ import net.minecraft.resources.ResourceLocation;
 
 public class PatternCompiler {
    public interface DetachedPattern extends IPatternDetails { }
-   /** Values observed at the live API boundary; no worker-thread world query is permitted. */
+   /** Input semantics supplied by the host. Live callbacks require AE2's exclusive calculation slice. */
    public interface DetachedInput extends IInput {
       AEKey craftedKey();
       boolean emittable();
-      /** Non-null only for a captured input whose semantics require this exact key and no return. */
+      /** Non-null only when the input semantics require this exact key and no return. */
       default AEKey exactKey() { return null; }
       /** Observe only candidates encountered by this VM request, in a server-owned batch. */
       default void prepareCandidates(java.util.Collection<AEKey> keys) { }

@@ -26,7 +26,7 @@ final class VmInstructionExecution {
     private final KeyCounter initialKeys = new KeyCounter();
     private final Node root;
     private final Map<AEKey, List<IPatternDetails>> knownProducers = new HashMap<>();
-    private final VmDemandProgram.Compiler demandCompiler = new VmDemandProgram.Compiler(knownProducers);
+    private final VmDemandProgram.Compiler demandCompiler;
     private boolean multiple;
     private boolean simulate;
     private long instructions;
@@ -38,6 +38,7 @@ final class VmInstructionExecution {
     private long stockKeyScans, minimumSnapshots, replays;
     private BigInteger skipped = ZERO;
     private final java.util.function.LongConsumer progress;
+    private final Runnable control;
     private final List<Trace> traces = new ArrayList<>();
 
     VmInstructionExecution(CraftingBytecode request, VmSimulationState inventory,
@@ -48,6 +49,13 @@ final class VmInstructionExecution {
     VmInstructionExecution(CraftingBytecode request, VmSimulationState inventory,
             Function<AEKey, List<IPatternDetails>> resolver, Predicate<AEKey> emitters,
             java.util.function.LongConsumer progress, boolean sparseBranches, boolean optimizedGuards) {
+        this(request, inventory, resolver, emitters, progress, sparseBranches, optimizedGuards, () -> { });
+    }
+    VmInstructionExecution(CraftingBytecode request, VmSimulationState inventory,
+            Function<AEKey, List<IPatternDetails>> resolver, Predicate<AEKey> emitters,
+            java.util.function.LongConsumer progress, boolean sparseBranches, boolean optimizedGuards, Runnable control) {
+        this.control = control;
+        demandCompiler = new VmDemandProgram.Compiler(knownProducers, this::checkpoint);
         this.sparseBranches = sparseBranches;
         this.optimizedGuards = optimizedGuards;
         this.resolver = resolver;
@@ -634,7 +642,8 @@ final class VmInstructionExecution {
                 merge(target, key, target.get(key).subtract(before.getOrDefault(key, ZERO)).multiply(repeats));
         } else target.forEach((key, value) -> merge(target, key, value.subtract(before.getOrDefault(key, ZERO)).multiply(repeats)));
     }
-    private static void checkpoint() {
+    private void checkpoint() {
+        control.run();
         if (Thread.currentThread().isInterrupted()) throw new CancellationException("VM calculation cancelled");
     }
     private static final class Missing extends RuntimeException {

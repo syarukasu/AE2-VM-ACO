@@ -20,6 +20,7 @@ public final class CraftingVM {
     private Function<AEKey, List<IPatternDetails>> allPatternsResolver;
     private Predicate<AEKey> emitterResolver = key -> false;
     private LongConsumer progress = ignored -> { };
+    private Runnable checkpoint = () -> { };
     private volatile boolean executing;
     private long instructions, work;
     private long stateCopies, branchTrials, branchEntries;
@@ -33,6 +34,7 @@ public final class CraftingVM {
     public void setAllPatternsResolver(Function<AEKey, List<IPatternDetails>> resolver) { allPatternsResolver = Objects.requireNonNull(resolver); }
     public void setEmitterResolver(Predicate<AEKey> resolver) { emitterResolver = Objects.requireNonNull(resolver); }
     public void setProgressListener(LongConsumer listener) { progress = Objects.requireNonNull(listener); }
+    public void setCheckpoint(Runnable control) { checkpoint = Objects.requireNonNull(control); }
     public boolean isExecuting() { return executing; }
     public long instructions() { return instructions; }
     public long work() { return work; }
@@ -53,7 +55,8 @@ public final class CraftingVM {
             var pattern = patternResolver.apply(key);
             return pattern == null ? List.of() : List.of(pattern);
         };
-        var interpreter = new VmInstructionExecution(request, simulation, choices, emitterResolver, progress);
+        var interpreter = new VmInstructionExecution(request, simulation, choices, emitterResolver, progress,
+                true, true, checkpoint);
         executing = true;
         try {
             return interpreter.execute(request.getExactOutputAmountPerCraft(), craftLess);

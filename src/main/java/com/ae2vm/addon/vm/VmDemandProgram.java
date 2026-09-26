@@ -48,7 +48,15 @@ final class VmDemandProgram {
         private final Map<IPatternDetails, VmDemandProgram> programs = new IdentityHashMap<>();
         private final Map<IPatternDetails, Integer> unavailable = new IdentityHashMap<>();
         private final Set<IPatternDetails> visiting = Collections.newSetFromMap(new IdentityHashMap<>());
-        Compiler(Map<AEKey, List<IPatternDetails>> known) { this.known = known; }
+        private final Runnable control;
+        Compiler(Map<AEKey, List<IPatternDetails>> known) { this(known, () -> { }); }
+        Compiler(Map<AEKey, List<IPatternDetails>> known, Runnable control) {
+            this.known = known; this.control = control;
+        }
+        private void checkpoint() {
+            VmDemandProgram.checkpoint();
+            control.run();
+        }
 
         VmDemandProgram get(IPatternDetails pattern) {
             checkpoint();
