@@ -150,9 +150,20 @@ final class NativeVmPlanningContext {
         public boolean isCandidatePrepared(AEKey key) { return true; }
         public boolean isValid(AEKey key, Level ignored) {
             stock.amount(key);
+            if (exact != null) {
+                checkpoint.run();
+                return exact.equals(key);
+            }
             return access.read(() -> source.isValid(key, level));
         }
-        public AEKey getRemainingKey(AEKey key) { return access.read(() -> source.getRemainingKey(key)); }
+        public AEKey getRemainingKey(AEKey key) {
+            // #218: exactKey already promises no return; repeated tree visits need no live callback.
+            if (exact != null && exact.equals(key)) {
+                checkpoint.run();
+                return null;
+            }
+            return access.read(() -> source.getRemainingKey(key));
+        }
     }
 
     private record LivePattern(AEItemKey definition, IPatternDetails.IInput[] inputs, GenericStack[] outputs)
