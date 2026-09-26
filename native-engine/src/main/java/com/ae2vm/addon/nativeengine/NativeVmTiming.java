@@ -17,6 +17,12 @@ final class NativeVmTiming {
     private long copies, branchTrials, branchEntries, aggregatedBlocks;
     private boolean ae2Scheduled;
     private long cpuStarted = -1;
+    private java.util.function.Supplier<NativeVmAccess.Metrics> accessMetrics;
+
+    void ae2Scheduled(NativeVmAccess access) {
+        accessMetrics = access::metrics;
+        ae2Scheduled();
+    }
 
     void ae2Scheduled() {
         ae2Scheduled = true;
@@ -83,6 +89,7 @@ final class NativeVmTiming {
         return result.toString();
     }
     synchronized String summary() {
+        var access = accessMetrics == null ? new NativeVmAccess.Metrics(0, 0, 0, 0) : accessMetrics.get();
         var types = new java.util.StringJoiner(",", "{", "}");
         patternTypes.forEach((name, count) -> types.add(name + ":" + count));
         return "stockMs=" + ms(phases[Phase.STOCK.ordinal()])
@@ -91,7 +98,10 @@ final class NativeVmTiming {
                 + " vmActiveMs=" + (ae2Scheduled ? -1 : ms(vmActive))
                 + " vmCpuMs=" + (cpuStarted < 0 ? -1 : ms(Math.max(0,
                         java.lang.management.ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime() - cpuStarted)))
-                + " scheduler=" + (ae2Scheduled ? "ae2" : "detached")
+                + " scheduler=" + (accessMetrics != null ? "ae2-boundary" : ae2Scheduled ? "ae2" : "detached")
+                + " ae2WorldWaitMs=" + ms(access.waitNanos())
+                + " ae2ExclusiveMs=" + ms(access.exclusiveNanos())
+                + " ae2Intervals=" + access.intervals() + " ae2Reads=" + access.reads()
                 + " validateMs=" + ms(phases[Phase.VALIDATE.ordinal()])
                 + " finalizeMs=" + ms(phases[Phase.FINALIZE.ordinal()])
                 + " serverQueueMs=" + ms(queued) + " serverWorkMs=" + ms(server)

@@ -82,8 +82,8 @@ public final class NativeVm {
                 }
                 if (task.isCancelled()) return;
                 job.set(new NativeVmCalculation(level, grid, output, strategy,
-                        checkpoint -> compute(order, started, grid, level, requester, output, requested,
-                                strategy, extension, stock, timing, checkpoint)));
+                        access -> compute(order, started, grid, level, requester, output, requested,
+                                strategy, extension, stock, timing, access)));
                 hook.vm$execute(task);
             } catch (Throwable failure) { task.fail(failure); }
         };
@@ -117,11 +117,11 @@ public final class NativeVm {
 
     static ICraftingPlan compute(long order, long started, IGrid grid, Level level,
             ICraftingSimulationRequester requester, AEKey output, BigInteger request, CalculationStrategy strategy,
-            VmAccounting extension, VmAccounting.Stock stock, NativeVmTiming timing, Runnable checkpoint) {
+            VmAccounting extension, VmAccounting.Stock stock, NativeVmTiming timing, NativeVmAccess access) {
         DIAGNOSTICS.started();
-        timing.ae2Scheduled();
+        timing.ae2Scheduled(access);
         try {
-            var context = new NativeVmPlanningContext(grid, level, requester, stock, checkpoint, timing);
+            var context = new NativeVmPlanningContext(grid, level, requester, stock, access, timing);
             var result = context.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS,
                     work -> DIAGNOSTICS.running(order, output.getId(), work, elapsed(started)));
             BigInteger bytes = bytes(result);
@@ -141,7 +141,7 @@ public final class NativeVm {
                     elapsed(started), plan.simulation() ? "missing" : "ready", profile));
             DIAGNOSTICS.completed(order, output.getId(), request, elapsed(started), plan.simulation(), profile);
             if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} "
-                    + "output={} requested={} scheduler=ae2 {}", order, output.getId(), request, profile);
+                    + "output={} requested={} {}", order, output.getId(), request, profile);
             return plan;
         } catch (CancellationException cancelled) {
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,

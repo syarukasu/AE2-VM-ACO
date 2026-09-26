@@ -19,25 +19,27 @@ import java.util.Objects;
 import java.util.function.LongConsumer;
 import net.minecraft.world.level.Level;
 
-/** Per-order VM state. Live pattern callbacks run only inside AE2's exclusive calculation slice. */
+/** Per-order VM state. Only live callbacks enter AE2's exclusive interval. */
 final class NativeVmPlanningContext {
     private final IGrid grid;
     private final Level level;
     private final ICraftingSimulationRequester requester;
     private final VmAccounting.Stock stock;
     private final Runnable checkpoint;
+    private final NativeVmAccess access;
     private final NativeVmTiming timing;
     private final Map<IPatternDetails, LivePattern> programs = new IdentityHashMap<>();
     private final Map<IPatternDetails, String> ids = new IdentityHashMap<>();
     private final Map<String, IPatternDetails> bindings = new LinkedHashMap<>();
 
     NativeVmPlanningContext(IGrid grid, Level level, ICraftingSimulationRequester requester,
-            VmAccounting.Stock stock, Runnable checkpoint, NativeVmTiming timing) {
+            VmAccounting.Stock stock, NativeVmAccess access, NativeVmTiming timing) {
         this.grid = grid;
         this.level = level;
         this.requester = requester;
         this.stock = stock;
-        this.checkpoint = checkpoint;
+        this.access = access;
+        this.checkpoint = access::checkpoint;
         this.timing = timing;
     }
 
@@ -48,7 +50,7 @@ final class NativeVmPlanningContext {
                 return choices.isEmpty() ? null : choices.get(0);
             });
             vm.setAllPatternsResolver(this::candidates);
-            vm.setEmitterResolver(key -> grid.getCraftingService().canEmitFor(key));
+            vm.setEmitterResolver(key -> access.read(() -> grid.getCraftingService().canEmitFor(key)));
             vm.setProgressListener(progress);
             vm.setCheckpoint(checkpoint);
             com.ae2vm.addon.vm.VmCraftingPlan result;
@@ -72,23 +74,26 @@ final class NativeVmPlanningContext {
 
     private List<IPatternDetails> candidates(AEKey key) {
         checkpoint.run();
-        var node = requester.getGridNode();
-        if (node == null) return List.of();
-        var service = node.getGrid().getCraftingService();
+        var service = access.read(() -> {
+            var node = requester.getGridNode();
+            return node == null ? null : node.getGrid().getCraftingService();
+        });
+        if (service == null) return List.of();
         // AE2 fixes each node's ordered producer list when that node is first explored.
-        var choices = List.copyOf(service.getCraftingFor(key));
+        var choices = access.read(() -> List.copyOf(service.getCraftingFor(key)));
         var result = new ArrayList<IPatternDetails>(choices.size());
         for (var source : choices) {
             checkpoint.run();
             var program = programs.get(source);
             if (program == null) {
-                var inputs = source.getInputs();
+                var inputs = access.read(() -> source.getInputs().clone());
                 var slots = new IPatternDetails.IInput[inputs.length];
                 for (int i = 0; i < inputs.length; i++) {
                     checkpoint.run();
-                    slots[i] = new LiveInput(source, inputs[i], service);
+                    var input = inputs[i];
+                    slots[i] = new LiveInput(source, input, service);
                 }
-                program = new LivePattern(source.getDefinition(), slots, source.getOutputs().clone());
+                program = access.read(() -> new LivePattern(source.getDefinition(), slots, source.getOutputs().clone()));
                 String id = "vm-" + bindings.size();
                 programs.put(source, program);
                 ids.put(program, id);
@@ -111,29 +116,30 @@ final class NativeVmPlanningContext {
         LiveInput(IPatternDetails pattern, IPatternDetails.IInput source,
                 appeng.api.networking.crafting.ICraftingService service) {
             this.source = source;
-            templates = source.getPossibleInputs().clone();
-            multiplier = source.getMultiplier();
+            templates = access.read(() -> source.getPossibleInputs().clone());
+            multiplier = access.read(source::getMultiplier);
             var primary = templates[0];
             stock.amount(primary.what());
-            emitted = service.canEmitFor(primary.what());
+            emitted = access.read(() -> service.canEmitFor(primary.what()));
             AEKey selected = primary.what();
-            if (!emitted && service.getCraftingFor(selected).isEmpty()) {
+            if (!emitted && access.read(() -> service.getCraftingFor(primary.what()).isEmpty())) {
                 for (var template : templates) {
                     checkpoint.run();
                     if (template.amount() != primary.amount()) continue;
-                    var fuzzy = service.getFuzzyCraftable(template.what(), candidate -> source.isValid(candidate, level));
+                    var fuzzy = access.read(() -> service.getFuzzyCraftable(template.what(),
+                            candidate -> source.isValid(candidate, level)));
                     if (fuzzy != null) { selected = fuzzy; break; }
                 }
             }
             crafted = selected;
             stock.amount(crafted);
-            boolean nativeExact = templates.length == 1
+            boolean nativeExact = access.read(() -> templates.length == 1
                     && (source.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input")
                     || (pattern.getClass() == appeng.crafting.pattern.AECraftingPattern.class
                     && !((appeng.crafting.pattern.AECraftingPattern) pattern).canSubstitute()
-                    && source.getClass().getName().equals("appeng.crafting.pattern.AECraftingPattern$Input")));
-            exact = nativeExact && source.isValid(primary.what(), level)
-                    && source.getRemainingKey(primary.what()) == null ? primary.what() : null;
+                    && source.getClass().getName().equals("appeng.crafting.pattern.AECraftingPattern$Input"))));
+            exact = nativeExact && access.read(() -> source.isValid(primary.what(), level)
+                    && source.getRemainingKey(primary.what()) == null) ? primary.what() : null;
         }
 
         public GenericStack[] getPossibleInputs() { return templates; }
@@ -144,9 +150,9 @@ final class NativeVmPlanningContext {
         public boolean isCandidatePrepared(AEKey key) { return true; }
         public boolean isValid(AEKey key, Level ignored) {
             stock.amount(key);
-            return source.isValid(key, level);
+            return access.read(() -> source.isValid(key, level));
         }
-        public AEKey getRemainingKey(AEKey key) { return source.getRemainingKey(key); }
+        public AEKey getRemainingKey(AEKey key) { return access.read(() -> source.getRemainingKey(key)); }
     }
 
     private record LivePattern(AEItemKey definition, IPatternDetails.IInput[] inputs, GenericStack[] outputs)
