@@ -13,9 +13,13 @@ import java.util.concurrent.ConcurrentHashMap;
 import net.minecraft.resources.ResourceLocation;
 
 public class PatternCompiler {
-   public interface DetachedPattern extends IPatternDetails { }
+   public interface DetachedPattern extends IPatternDetails {
+      default int inputCount() { return getInputs().length; }
+      default BigInteger outputScale() { return BigInteger.ONE; }
+   }
    /** Input semantics supplied by the host. Live callbacks require AE2's exclusive calculation slice. */
    public interface DetachedInput extends IInput {
+      default BigInteger exactMultiplier() { return BigInteger.valueOf(getMultiplier()); }
       AEKey craftedKey();
       boolean emittable();
       /** Non-null only when the input semantics require this exact key and no return. */
@@ -24,6 +28,15 @@ public class PatternCompiler {
       default void prepareCandidates(java.util.Collection<AEKey> keys) { }
       /** Readiness only, not validity: preserve the ordered cached prefix without speculative handoffs. */
       default boolean isCandidatePrepared(AEKey key) { return false; }
+      /** False only when the captured candidate domain has no possible returns. */
+      default boolean mayReturnItems() { return exactKey() == null; }
+      /** Whether an output can feed this input on the next execution of the pattern. */
+      default boolean mayConsumeOutput(AEKey key) {
+         if (exactKey() != null) return exactKey().equals(key);
+         for (var template : getPossibleInputs())
+            if (template.what().getPrimaryKey().equals(key.getPrimaryKey())) return true;
+         return false;
+      }
    }
    public interface Scope extends AutoCloseable { @Override void close(); }
    private static final class State {
@@ -38,7 +51,6 @@ public class PatternCompiler {
       STATE.set(new State());
       return () -> STATE.set(previous);
    }
-   private static final Map<IPatternDetails, CraftingBytecode> COMPILED_PATTERNS = new ConcurrentHashMap<>();
 
    /**
     * (v1.11.x PATTERN-REFRESH) Monotonic version of the network's pattern set. Bumped
@@ -66,52 +78,6 @@ public class PatternCompiler {
       // LOG disabled (v1.8.20/GTL): keep only total calc time.
       // AE2VMAddon.LOGGER.info("[AE2-VM] bumpPatternVersion: {} -> {}", patternVersion - 1, patternVersion);
    }
-
-   /**
-    * Fuzzy / fluid-substitution groups (v1.9.13): pattern inputs whose
-    * {@code getPossibleInputs()} returns MORE than one variant — i.e. the encoded
-    * pattern has item-replacement (物品替换) or fluid-replacement (流体替换) enabled.
-    * Each group maps every variant key to the full set of acceptable variants, so the
-    * VM's missing-check can see that e.g. gray wool can be satisfied by white wool
-    * stock. Groups are registered from {@link #registerFuzzyGroups(IPatternDetails)},
-    * which {@link #compilePattern(IPatternDetails)} calls for every compiled pattern,
-    * and are consumed by {@code CraftingVM}'s aggregation (fuzzy-group stock) and the
-    * no-sub-pattern leaf check.
-    */
-   private static final Map<AEKey, java.util.Set<AEKey>> FUZZY_GROUPS = new ConcurrentHashMap<>();
-
-   /**
-    * Processing-recipe input keys (v1.10.x). Processing recipes (处理配方) default to
-    * FUZZY matching: a stored variant of the input item (same item, any NBT/damage —
-    * {@code FuzzyMode.IGNORE_ALL}) satisfies the slot, even though AE2's
-    * {@code AEProcessingPattern} encodes each input as a single exact variant with no
-    * substitution flag. This mirrors AE2 native's inventory-level lookup
-    * ({@code CraftingCpuHelper.getValidItemTemplates} → {@code findFuzzyTemplates}),
-    * which the VM was missing — it treated processing inputs as exact and reported
-    * false "missing" (GTL greenhouse fake-craft / Mystical Agriculture essence:
-    * "材料缺失但不知道哪里缺失", "有方块却报缺失"). Keys are collected from every
-    * processing pattern at compile time and consumed by {@code CraftingVM}'s
-    * missing-check / stock-aware aggregation / extraction.
-    */
-   private static final java.util.Set<AEKey> PROCESSING_INPUT_KEYS = ConcurrentHashMap.newKeySet();
-
-   /**
-    * (v1.10.x PRODUCTIVE_BEES) EXACT processing-recipe input keys. AE2's native
-    * {@code AEProcessingPattern} encodes each input as a single EXACT variant and its
-    * {@code IInput.isValid} is {@code input.matches(template[0])} = exact {@code equals}
-    * (see CraftingCpuHelper.getValidItemTemplates, which filters every
-    * {@code findFuzzyTemplates} NBT variant through {@code isValid} — only the encoded
-    * exact variant passes). So for AE2-native processing patterns a different-NBT variant
-    * of the same item (e.g. Productive Bees honeycombs with different {@code bee_type}
-    * components) must NOT satisfy the slot — using the wrong honeycomb variant would
-    * consume the wrong raw material. Only third-party patterns whose {@code isValid}
-    * genuinely accepts variants (GTL greenhouse, MA essence, UselessMod omniversal) keep
-    * the v1.10.x default-fuzzy behaviour via {@link #PROCESSING_INPUT_KEYS}.
-    * <p>Keys are moved here (from the default-fuzzy set) by
-    * {@link #registerFuzzyGroups(IPatternDetails)} for AE2-native patterns, or registered
-    * directly by callers via {@link #registerExactProcessingInput(AEKey)}.
-    */
-   private static final java.util.Set<AEKey> EXACT_PROCESSING_KEYS = ConcurrentHashMap.newKeySet();
 
    /** True for patterns that are NOT molecular-assembler crafting patterns. */
    private static boolean isProcessingPattern(IPatternDetails pattern) {
@@ -152,12 +118,8 @@ public class PatternCompiler {
          return;
       }
       boolean processing = isProcessingPattern(pattern);
-      // (v1.10.x PRODUCTIVE_BEES) AE2's native processing pattern encodes each input as an
-      // EXACT variant (its IInput.isValid is exact equals — see class doc on
-      // EXACT_PROCESSING_KEYS). A different-NBT variant (e.g. a honeycomb with another
-      // bee_type component) must NOT satisfy such a slot — otherwise the VM consumes the
-      // WRONG honeycomb as raw material. Only third-party processing patterns (whose
-      // isValid genuinely accepts variants) keep the default-fuzzy PROCESSING_INPUT set.
+      // Native processing inputs require exact NBT identity; retain that distinction
+      // in the request-local State even when candidate lookup supports fuzzy matches.
       boolean nativeAE2Processing = pattern instanceof appeng.crafting.pattern.AEProcessingPattern;
       IPatternDetails.IInput[] patternInputs = pattern.getInputs();
       if (patternInputs == null) {
@@ -338,7 +300,7 @@ public class PatternCompiler {
       var builder = new CraftingBytecode.Builder();
       var primary = pattern.getPrimaryOutput();
       if (primary.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
-      builder.setOutput(builder.addConstant(primary.what()), primary.amount());
+      builder.setOutput(builder.addConstant(primary.what()), outputAmount(pattern, primary));
       int patternIndex = builder.addPattern(pattern);
       var inputs = pattern.getInputs();
       for (int slot = 0; slot < inputs.length; slot++) {
@@ -347,7 +309,7 @@ public class PatternCompiler {
                || java.util.Arrays.stream(alternatives).anyMatch(t -> t == null || t.amount() <= 0))
             throw new IllegalArgumentException("positive pattern input required");
          BigInteger amount = BigInteger.valueOf(alternatives[0].amount())
-               .multiply(BigInteger.valueOf(inputs[slot].getMultiplier()));
+               .multiply(inputMultiplier(inputs[slot]));
          builder.emit(Opcode.DUP);
          builder.emitPushAmount(amount);
          builder.emit(Opcode.MUL);
@@ -359,7 +321,7 @@ public class PatternCompiler {
          if (output.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
          int index = builder.addConstant(output.what());
          builder.emit(Opcode.DUP);
-         builder.emitPushLong(output.amount());
+         builder.emitPushAmount(outputAmount(pattern, output));
          builder.emit(Opcode.MUL);
          builder.emitInsertOutput(index);
       }
@@ -428,6 +390,15 @@ public class PatternCompiler {
          throw new IllegalArgumentException("invalid exact division");
       var divided = amount.divideAndRemainder(output);
       return divided[1].signum() == 0 ? divided[0] : divided[0].add(BigInteger.ONE);
+   }
+
+   public static BigInteger inputMultiplier(IInput input) {
+      return input instanceof DetachedInput detached ? detached.exactMultiplier() : BigInteger.valueOf(input.getMultiplier());
+   }
+
+   public static BigInteger outputAmount(IPatternDetails pattern, GenericStack output) {
+      var scale = pattern instanceof DetachedPattern detached ? detached.outputScale() : BigInteger.ONE;
+      return BigInteger.valueOf(output.amount()).multiply(scale);
    }
 
    public static IPatternDetails findCompiledByOutput(Object network, AEKey outputKey) {

@@ -23,10 +23,13 @@ final class VmInstructionExecution {
     private final Function<AEKey, List<IPatternDetails>> resolver;
     private final Predicate<AEKey> emitters;
     private final Map<AEKey, BigInteger> initial;
+    private final boolean completeStock;
     private final KeyCounter initialKeys = new KeyCounter();
     private final Node root;
     private final Map<AEKey, List<IPatternDetails>> knownProducers = new HashMap<>();
     private final VmDemandProgram.Compiler demandCompiler;
+    private final Map<IPatternDetails, ProcessMetadata> processMetadata = new IdentityHashMap<>();
+    private final Map<VmDemandProgram, CapacityShape> capacityShapes = new IdentityHashMap<>();
     private boolean multiple;
     private boolean simulate;
     private long instructions;
@@ -55,13 +58,14 @@ final class VmInstructionExecution {
             Function<AEKey, List<IPatternDetails>> resolver, Predicate<AEKey> emitters,
             java.util.function.LongConsumer progress, boolean sparseBranches, boolean optimizedGuards, Runnable control) {
         this.control = control;
-        demandCompiler = new VmDemandProgram.Compiler(knownProducers, this::checkpoint);
+        demandCompiler = new VmDemandProgram.Compiler(knownProducers, resolver, this::checkpoint);
         this.sparseBranches = sparseBranches;
         this.optimizedGuards = optimizedGuards;
         this.resolver = resolver;
         this.emitters = emitters;
         this.progress = progress;
         initial = new LinkedHashMap<>(inventory.initialStock());
+        completeStock = inventory.complete();
         initial.put(request.getOutput(), ZERO);
         initial.keySet().forEach(key -> initialKeys.add(key, 1));
         root = new Node(request.getOutput(), ONE, null, null);
@@ -78,6 +82,10 @@ final class VmInstructionExecution {
     BigInteger skippedIterations() { return skipped; }
 
     VmCraftingPlan execute(BigInteger amount, boolean craftLess) {
+        if (optimizedGuards) {
+            var direct = craftLess ? directCraftLessPlan(amount) : directPlan(amount);
+            if (direct != null) return direct;
+        }
         var result = attempt(amount, false);
         if (result != null) return result;
         if (craftLess) {
@@ -91,6 +99,138 @@ final class VmInstructionExecution {
             if (result != null) return result;
         }
         return Objects.requireNonNull(attempt(amount, true));
+    }
+
+    private VmCraftingPlan directCraftLessPlan(BigInteger amount) {
+        if (!completeStock || root.emit) return null;
+        var choices = root.processes();
+        if (choices.size() != 1) return null;
+        var process = choices.get(0);
+        var program = demandCompiler.getExpanded(process.pattern,
+                key -> initial.getOrDefault(key, ZERO).signum() > 0);
+        if (program == null) return null;
+        if (!program.period.equals(ONE)) {
+            // #218: fractional shared paths have trial-dependent conceptual node charges.
+            var seen = Collections.newSetFromMap(new IdentityHashMap<VmDemandProgram, Boolean>());
+            var pending = new ArrayDeque<VmDemandProgram>();
+            pending.add(program);
+            while (!pending.isEmpty()) {
+                checkpoint();
+                var current = pending.removeFirst();
+                if (!seen.add(current)) return null;
+                for (var child : current.children) if (child != null) pending.addLast(child);
+            }
+        }
+        // #218: raw-demand bounds cannot replace available intermediate stock or its producers.
+        for (var key : program.intermediates)
+            if (initial.getOrDefault(key, ZERO).signum() > 0) return null;
+        var output = process.output(root.key);
+        var requestedTimes = PatternCompiler.ceilDiv(amount, output);
+        var upperTimes = requestedTimes;
+        for (var entry : program.needs.entrySet()) {
+            checkpoint();
+            var leaf = program.leaves.get(entry.getKey());
+            if (leaf.emit()) continue;
+            var coefficient = entry.getValue();
+            if (coefficient.numerator().signum() <= 0) continue;
+            var available = initial.getOrDefault(entry.getKey(), ZERO);
+            var fundedTimes = available.multiply(coefficient.denominator()).divide(coefficient.numerator());
+            if (leaf.stockOnly() && fundedTimes.compareTo(requestedTimes) < 0
+                    && !knownProducers.computeIfAbsent(entry.getKey(), resolver).isEmpty()) return null;
+            upperTimes = upperTimes.min(fundedTimes);
+        }
+        if (!program.period.equals(ONE)) {
+            // Failed full-size trials also establish AE2's conceptual capacity tree.
+            var requested = attempt(amount, false);
+            if (requested != null) return requested;
+        }
+        // Exact whole periods form a funded lower bound; fractional requirements only an upper bound.
+        var lowerTimes = upperTimes.divide(program.period).multiply(program.period);
+        var upper = amount.min(upperTimes.multiply(output));
+        var lower = amount.min(lowerTimes.multiply(output));
+        if (upper.signum() == 0) {
+            return requestedTimes.remainder(program.period).signum() == 0
+                    ? materializeDirect(amount, process, program, requestedTimes, true) : attempt(amount, true);
+        }
+        if (lower.equals(upper)) return materializeDirect(upper, process, program, lowerTimes, false);
+        var result = attempt(upper, false);
+        if (result != null) return result;
+        var high = upper.subtract(ONE);
+        result = lower.signum() > 0 ? attempt(lower, false) : null;
+        while (lower.compareTo(high) < 0) {
+            checkpoint();
+            var candidate = lower.add(high).add(ONE).shiftRight(1);
+            var trial = attempt(candidate, false);
+            if (trial == null) high = candidate.subtract(ONE);
+            else { lower = candidate; result = trial; }
+        }
+        return result != null ? result : attempt(amount, true);
+    }
+
+    private VmCraftingPlan directPlan(BigInteger amount) {
+        if (!completeStock || root.emit) return null;
+        var choices = root.processes();
+        if (choices.isEmpty()) return null;
+        Process first = null;
+        VmDemandProgram firstProgram = null;
+        BigInteger firstTimes = null;
+        for (var process : choices) {
+            var program = demandCompiler.getExpanded(process.pattern,
+                    key -> initial.getOrDefault(key, ZERO).signum() > 0);
+            if (program == null) return null;
+            if (choices.size() > 1 && !program.period.equals(ONE)) return null;
+            var times = PatternCompiler.ceilDiv(amount, process.output(root.key));
+            if (times.remainder(program.period).signum() != 0) return null;
+            for (var key : program.intermediates)
+                if (initial.getOrDefault(key, ZERO).signum() != 0) return null;
+            boolean resolved = false;
+            for (var entry : program.needs.entrySet()) {
+                var key = entry.getKey();
+                var leaf = program.leaves.get(key);
+                if (leaf.emit() || !leaf.stockOnly()
+                        || initial.getOrDefault(key, ZERO).compareTo(entry.getValue().scale(times)) >= 0) continue;
+                if (!knownProducers.computeIfAbsent(key, resolver).isEmpty()) return null;
+                resolved = true;
+            }
+            if (resolved) {
+                program = demandCompiler.getExpanded(process.pattern,
+                        key -> initial.getOrDefault(key, ZERO).signum() > 0);
+                if (program == null || times.remainder(program.period).signum() != 0) return null;
+            }
+            for (var key : program.intermediates)
+                if (initial.getOrDefault(key, ZERO).signum() != 0) return null;
+            boolean shortage = false, impossible = false;
+            for (var entry : program.needs.entrySet()) {
+                var key = entry.getKey();
+                var leaf = program.leaves.get(key);
+                var available = initial.getOrDefault(key, ZERO);
+                if (leaf.stockOnly() && available.compareTo(entry.getValue().scale(times)) < 0) return null;
+                if (leaf.emit() || available.compareTo(entry.getValue().scale(times)) >= 0) continue;
+                shortage = true;
+                if (program.period.equals(ONE) && available.multiply(entry.getValue().denominator())
+                        .compareTo(entry.getValue().numerator()) < 0) impossible = true;
+            }
+            if (first == null) { first = process; firstProgram = program; firstTimes = times; }
+            if (!shortage) return materializeDirect(amount, process, program, times, false);
+            if (choices.size() == 1) return materializeDirect(amount, process, program, times, true);
+            if (!impossible) return null;
+        }
+        return materializeDirect(amount, first, firstProgram, firstTimes, true);
+    }
+
+    private VmCraftingPlan materializeDirect(BigInteger amount, Process process,
+            VmDemandProgram program, BigInteger times, boolean simulation) {
+        simulate = simulation;
+        var state = new State();
+        work++;
+        state.charge(root.key, amount);
+        applyAggregate(process, program, times, state);
+        if (state.extract(root.key, amount).compareTo(amount) != 0)
+            throw new IllegalStateException("VM demand program did not produce its requested output");
+        state.bytes = state.bytes.add(new VmByteCost(root.nodeCount(null).multiply(BigInteger.valueOf(8)), ONE));
+        return new VmCraftingPlan(new VmStack(root.key, amount), state.bytes.ceiling(), simulation,
+                multiple, new VmKeyCounter(state.used), new VmKeyCounter(state.emitted),
+                new VmKeyCounter(state.missing), state.patterns);
     }
 
     private VmCraftingPlan attempt(BigInteger amount, boolean simulation) {
@@ -120,7 +260,7 @@ final class VmInstructionExecution {
             emit = input instanceof PatternCompiler.DetachedInput detached ? detached.emittable() : emitters.test(encoded);
         }
 
-        BigInteger nodeCount(VmDemandProgram inherited) {
+        BigInteger nodeCount(CapacityShape inherited) {
             var count = ONE;
             boolean inheritedFound = false;
             if (processes != null) for (var process : processes) {
@@ -156,30 +296,37 @@ final class VmInstructionExecution {
 
     private final class Process {
         final IPatternDetails pattern;
-        final CraftingBytecode code;
-        final List<Node> inputs = new ArrayList<>();
-        final boolean single;
-        final boolean containers;
+        List<Node> inputs;
         final Node parent;
-        VmDemandProgram aggregatedShape;
+        ProcessMetadata metadata;
+        CapacityShape aggregatedShape;
         Process(IPatternDetails pattern, Node parent) {
             this.pattern = pattern;
             this.parent = parent;
-            PatternCompiler.compileIfAbsent(pattern);
-            code = Objects.requireNonNull(PatternCompiler.getCompiled(pattern));
-            boolean limited = false, returned = false;
-            for (var slot : pattern.getInputs()) {
-                var primary = slot.getPossibleInputs()[0];
-                inputs.add(new Node(primary.what(), BigInteger.valueOf(primary.amount()), slot, parent));
-                if (slot.getRemainingKey(primary.what()) != null) { limited = true; returned = true; }
-                for (var output : pattern.getOutputs()) if (output.what().equals(primary.what())) limited = true;
-            }
-            single = limited;
-            containers = returned;
         }
-        BigInteger nodeCount(VmDemandProgram inherited) {
-            var shape = inherited;
-            if (aggregatedShape != null && (shape == null || shape.generation < aggregatedShape.generation)) shape = aggregatedShape;
+        List<Node> inputs() {
+            if (inputs == null) {
+                inputs = new ArrayList<>();
+                for (var slot : pattern.getInputs()) {
+                    var primary = slot.getPossibleInputs()[0];
+                    inputs.add(new Node(primary.what(), BigInteger.valueOf(primary.amount()), slot, parent));
+                }
+            }
+            return inputs;
+        }
+        ProcessMetadata metadata() {
+            if (metadata == null) metadata = processMetadata.computeIfAbsent(pattern,
+                    VmInstructionExecution.this::inspectProcess);
+            return metadata;
+        }
+        BigInteger nodeCount(CapacityShape inherited) {
+            var shape = CapacityShape.union(inherited, aggregatedShape);
+            if (inputs == null) {
+                var count = BigInteger.valueOf(pattern instanceof PatternCompiler.DetachedPattern detached
+                        ? detached.inputCount() : pattern.getInputs().length);
+                if (shape != null) for (var child : shape.children) if (child != null) count = count.add(child.nodes);
+                return count;
+            }
             var count = ZERO;
             for (int i = 0; i < inputs.size(); i++)
                 count = count.add(inputs.get(i).nodeCount(shape == null ? null : shape.children.get(i)));
@@ -188,10 +335,101 @@ final class VmInstructionExecution {
         BigInteger output(AEKey key) {
             BigInteger amount = ZERO;
             for (var output : pattern.getOutputs()) if (output.what().equals(key))
-                amount = amount.add(BigInteger.valueOf(output.amount()));
+                amount = amount.add(PatternCompiler.outputAmount(pattern, output));
             if (amount.signum() <= 0) throw new IllegalStateException("VM producer does not produce requested key");
             return amount;
         }
+    }
+
+    private CapacityShape capacityShape(VmDemandProgram program) {
+        if (program == null) return null;
+        var cached = capacityShapes.get(program);
+        if (cached != null) return cached;
+        var children = new ArrayList<CapacityShape>();
+        for (var child : program.children) children.add(capacityShape(child));
+        var result = new CapacityShape(program.pattern, children);
+        capacityShapes.put(program, result);
+        return result;
+    }
+
+    /** #218: visited capacity nodes survive later stock-boundary summaries. No quantity state is retained. */
+    private static final class CapacityShape {
+        final IPatternDetails pattern;
+        final List<CapacityShape> children;
+        final BigInteger nodes;
+        CapacityShape(IPatternDetails pattern, List<CapacityShape> children) {
+            this.pattern = pattern;
+            this.children = Collections.unmodifiableList(children);
+            var count = BigInteger.valueOf(children.size());
+            for (var child : children) if (child != null) count = count.add(child.nodes);
+            nodes = count;
+        }
+        private record Pair(CapacityShape first, CapacityShape second) { }
+        static CapacityShape union(CapacityShape first, CapacityShape second) {
+            if (first == null) return second;
+            if (second == null || first == second) return first;
+            return union(first, second, new HashMap<>());
+        }
+        private static CapacityShape union(CapacityShape first, CapacityShape second, Map<Pair, CapacityShape> memo) {
+            if (first == null) return second;
+            if (second == null || first == second) return first;
+            var pair = new Pair(first, second);
+            var cached = memo.get(pair);
+            if (cached != null) return cached;
+            if (first.pattern != second.pattern || first.children.size() != second.children.size())
+                throw new IllegalStateException("incompatible VM capacity shapes");
+            var children = new ArrayList<CapacityShape>();
+            boolean sameFirst = true, sameSecond = true;
+            for (int i = 0; i < first.children.size(); i++) {
+                var child = union(first.children.get(i), second.children.get(i), memo);
+                children.add(child);
+                sameFirst &= child == first.children.get(i);
+                sameSecond &= child == second.children.get(i);
+            }
+            var result = sameFirst ? first : sameSecond ? second : new CapacityShape(first.pattern, children);
+            memo.put(pair, result);
+            return result;
+        }
+    }
+
+    private static final class ProcessMetadata {
+        private final boolean single, containers;
+        private CraftingBytecode code;
+
+        ProcessMetadata(boolean single, boolean containers) {
+            this.single = single;
+            this.containers = containers;
+        }
+
+        CraftingBytecode code(IPatternDetails pattern) {
+            // #218: retain compiled blocks without compiling unused alternatives.
+            if (code == null) {
+                PatternCompiler.compileIfAbsent(pattern);
+                code = Objects.requireNonNull(PatternCompiler.getCompiled(pattern));
+            }
+            return code;
+        }
+    }
+
+    private ProcessMetadata inspectProcess(IPatternDetails pattern) {
+        boolean limited = false, returned = false;
+        for (var slot : pattern.getInputs()) {
+            var templates = slot.getPossibleInputs();
+            returned |= slot.getRemainingKey(templates[0].what()) != null;
+            if (slot instanceof PatternCompiler.DetachedInput detached) {
+                returned |= detached.mayReturnItems();
+                for (var output : pattern.getOutputs()) limited |= detached.mayConsumeOutput(output.what());
+            } else {
+                for (int i = 1; i < templates.length; i++) {
+                    try { returned |= slot.getRemainingKey(templates[i].what()) != null; }
+                    catch (CancellationException cancelled) { throw cancelled; }
+                    catch (RuntimeException unused) { returned = true; }
+                }
+            }
+            for (var candidate : slot.getPossibleInputs())
+                for (var output : pattern.getOutputs()) if (output.what().equals(candidate.what())) limited = true;
+        }
+        return new ProcessMetadata(limited || returned, returned);
     }
 
     private void request(Node node, BigInteger count, State state, Map<AEKey, BigInteger> returns) {
@@ -265,10 +503,50 @@ final class VmInstructionExecution {
         var demand = remaining.multiply(node.unit);
         if (node.emit) { merge(state.emitted, node.key, demand); return; }
         var choices = node.processes();
+        if (simulate && choices.size() > 1) {
+            // #218: an unrelated shortage must not make an unfunded first route hide a funded alternative.
+            simulate = false;
+            try { demand = craft(node, demand, state, choices); }
+            finally { simulate = true; }
+            if (demand.signum() > 0) demand = craft(node, demand, state, choices.subList(0, 1));
+        } else {
+            demand = craft(node, demand, state, choices);
+        }
+        if (demand.signum() == 0) return;
+        if (!simulate) throw new Missing();
+        merge(state.missing, node.key, demand);
+    }
+
+    private BigInteger craft(Node node, BigInteger demand, State state, List<Process> choices) {
+        boolean alternatives = node.processes().size() > 1;
         for (var process : choices) {
+            var metadata = process.metadata();
             var output = process.output(node.key);
+            while (optimizedGuards && alternatives && !metadata.single && demand.signum() > 0) {
+                var program = demandCompiler.get(process.pattern);
+                if (program == null) break;
+                program = demandCompiler.stocked(program, key -> state.amount(key).signum() > 0);
+                if (program == null) break;
+                var times = PatternCompiler.ceilDiv(demand, output);
+                var batch = fundedAggregatePrefix(process, program, times, state);
+                if (batch.signum() == 0) break;
+                boolean transaction = alternatives;
+                var trial = !transaction ? state : sparseBranches ? new State(state) : state.copy();
+                if (transaction) branchTrials++;
+                applyAggregate(process, program, batch, trial);
+                var taken = trial.extract(node.key, demand);
+                if (taken.signum() == 0) throw new IllegalStateException("VM produced no requested output");
+                if (transaction) {
+                    branchEntries += sparseBranches ? trial.changedEntries() : trial.entries();
+                    if (sparseBranches) trial.commitTo(state);
+                    else state.adopt(trial);
+                }
+                demand = demand.subtract(taken);
+                if (demand.signum() == 0) return ZERO;
+                // A depleted stocked boundary can still be crafted by this same producer.
+            }
             // #217: bulk-only producers need no local replay snapshot. Enclosing traces still observe all reads.
-            if (choices.size() == 1 && !process.single) {
+            if (!alternatives && !metadata.single) {
                 while (demand.signum() > 0) {
                     checkpoint();
                     run(process, PatternCompiler.ceilDiv(demand, output), state);
@@ -276,7 +554,7 @@ final class VmInstructionExecution {
                     if (taken.signum() == 0) throw new IllegalStateException("VM produced no requested output");
                     demand = demand.subtract(taken);
                 }
-                return;
+                return ZERO;
             }
             // A one-shot process cannot replay; enclosing traces still observe reads and failed trials.
             var window = !optimizedGuards || demand.compareTo(output) > 0 ? new Trace(state) : null;
@@ -286,13 +564,18 @@ final class VmInstructionExecution {
             try {
             while (demand.signum() > 0) {
                 checkpoint();
-                boolean transaction = choices.size() > 1;
+                boolean transaction = alternatives;
                 if (transaction) branchTrials++;
                 var target = !transaction ? state : sparseBranches ? new State(state) : state.copy();
-                var times = transaction || process.single ? ONE : PatternCompiler.ceilDiv(demand, output);
+                var times = transaction || metadata.single ? ONE : PatternCompiler.ceilDiv(demand, output);
                 BigInteger taken;
                 try {
-                    run(process, times, target);
+                    var program = optimizedGuards && transaction && !metadata.single ? demandCompiler.get(process.pattern) : null;
+                    if (program != null) program = demandCompiler.stocked(program, key -> target.amount(key).signum() > 0);
+                    var bulk = program == null ? ZERO : fundedAggregatePrefix(process, program,
+                            PatternCompiler.ceilDiv(demand, output), target);
+                    if (bulk.signum() > 0) applyAggregate(process, program, bulk, target);
+                    else run(process, times, target);
                     taken = target.extract(node.key, demand);
                     if (taken.signum() == 0) throw new IllegalStateException("VM produced no requested output");
                 } catch (Missing failure) {
@@ -333,16 +616,16 @@ final class VmInstructionExecution {
                     window.finish(state); traces.remove(traces.size() - 1);
                     window = new Trace(state); traces.add(window);
                     windowOutput = ZERO; iterations = 0;
-                    windowSize = Math.min(1_048_576, windowSize * 2);
+                    // #218: grow only an exhausted search, not successful replay or a changed key domain.
+                    windowSize = repeats.signum() > 0 || !sameKeys ? 64 : Math.min(1_048_576, windowSize * 2);
                 }
             }
             } finally {
                 if (window != null) { window.finish(state); traces.remove(traces.size() - 1); }
             }
-            if (demand.signum() == 0) return;
+            if (demand.signum() == 0) return ZERO;
         }
-        if (!simulate) throw new Missing();
-        merge(state.missing, node.key, demand);
+        return demand;
     }
 
     private void addReturn(Node node, AEKey consumed, BigInteger count, Map<AEKey, BigInteger> returns) {
@@ -353,15 +636,16 @@ final class VmInstructionExecution {
 
     /** Execute original stack arithmetic/output opcodes plus slot-aware input/return instructions. */
     private void run(Process process, BigInteger times, State state) {
-        if (optimizedGuards && !process.single) {
+        var metadata = process.metadata();
+        if (optimizedGuards && !metadata.single) {
             var program = demandCompiler.get(process.pattern);
             if (program != null && aggregate(process, program, times, state)) return;
         }
-        var code = process.code;
+        var code = metadata.code(process.pattern);
         var buffer = ByteBuffer.wrap(code.getCode());
         var stack = new ArrayDeque<BigInteger>();
         stack.push(times);
-        var returns = process.containers ? new LinkedHashMap<AEKey, BigInteger>() : null;
+        var returns = metadata.containers ? new LinkedHashMap<AEKey, BigInteger>() : null;
         while (buffer.hasRemaining()) {
             checkpoint(); instructions++;
             switch (Opcode.fromCode(buffer.get())) {
@@ -374,7 +658,7 @@ final class VmInstructionExecution {
                 case SUB -> { var right = stack.pop(); stack.push(stack.pop().subtract(right)); }
                 case DIV_ROUNDUP -> { var right = stack.pop(); stack.push(PatternCompiler.ceilDiv(stack.pop(), right)); }
                 case REQUEST_INPUT -> {
-                    var input = process.inputs.get(Short.toUnsignedInt(buffer.getShort()));
+                    var input = process.inputs().get(Short.toUnsignedInt(buffer.getShort()));
                     var raw = stack.pop().divideAndRemainder(input.unit);
                     if (raw[1].signum() != 0) throw new IllegalStateException("non-integral VM input template");
                     request(input, raw[0], state, returns);
@@ -398,6 +682,29 @@ final class VmInstructionExecution {
 
     /** #218: combine shared demands once. No inventory snapshot or one-craft trial is multiplied. */
     private boolean aggregate(Process process, VmDemandProgram program, BigInteger times, State state) {
+        program = demandCompiler.stocked(program, key -> state.amount(key).signum() > 0);
+        if (program == null) return false;
+        if (!canAggregate(process, program, times, state)) return false;
+        applyAggregate(process, program, times, state);
+        return true;
+    }
+
+    private BigInteger fundedAggregatePrefix(Process process, VmDemandProgram program, BigInteger upper, State state) {
+        // #218: fractional per-craft calls visit different AE2 nodes and cannot share capacity accounting.
+        if (!program.period.equals(ONE)) return ZERO;
+        if (canAggregate(process, program, upper, state)) return upper;
+        var limit = upper;
+        for (var entry : program.needs.entrySet()) {
+            if (program.leaves.get(entry.getKey()).emit()) continue;
+            var amount = entry.getValue();
+            if (amount.numerator().signum() > 0) limit = limit.min(state.amount(entry.getKey())
+                    .multiply(amount.denominator()).divide(amount.numerator()));
+        }
+        limit = limit.divide(program.period).multiply(program.period);
+        return limit.signum() > 0 && canAggregate(process, program, limit, state) ? limit : ZERO;
+    }
+
+    private boolean canAggregate(Process process, VmDemandProgram program, BigInteger times, State state) {
         if (times.remainder(program.period).signum() != 0) return false;
         for (var ancestor = process.parent.ancestor; ancestor != null; ancestor = ancestor.ancestor)
             if (program.dependencies.contains(ancestor.key)) return false;
@@ -407,6 +714,10 @@ final class VmInstructionExecution {
             if ((leaf.stockOnly() || !simulate && !leaf.emit())
                     && state.amount(entry.getKey()).compareTo(entry.getValue().scale(times)) < 0) return false;
         }
+        return true;
+    }
+
+    private void applyAggregate(Process process, VmDemandProgram program, BigInteger times, State state) {
         checkpoint();
         aggregatedBlocks++;
         // Preserve only actual dependencies for an enclosing state-dependent repetition.
@@ -424,8 +735,7 @@ final class VmInstructionExecution {
         program.outputs.forEach((key, amount) -> state.insert(key, amount.scale(times)));
         program.crafts.forEach((pattern, amount) -> merge(state.patterns, pattern, amount.scale(times)));
         state.bytes = state.bytes.add(program.bytes.multiply(times));
-        process.aggregatedShape = program;
-        return true;
+        process.aggregatedShape = CapacityShape.union(process.aggregatedShape, capacityShape(program));
     }
 
     private final class State {

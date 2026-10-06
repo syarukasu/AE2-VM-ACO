@@ -1,3 +1,11 @@
+# AE2-VM-ACO: experimental BigInteger fork
+
+This branch supplies the VM source bundled by ACO's Forge 1.20.1 snapshot.
+See [the ACO fork build and scope notes](README_ACO.md) before building.
+The historical upstream README below describes upstream releases, not measured
+performance or compatibility of this fork. Do not run the upstream root build
+or deployment tasks to produce an ACO distribution.
+
 # AE2 VM — AE2 合成虚拟机
 
 ![Minecraft](https://img.shields.io/badge/Minecraft-1.20.1-blue?logo=minecraft)

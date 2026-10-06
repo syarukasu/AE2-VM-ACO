@@ -5,31 +5,46 @@ import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /** #218: only live callbacks need an exclusive AE2 interval, not VM arithmetic. */
-final class NativeVmAccess {
+final class NativeVmAccess implements NativeVmTiming.AccessObservation {
+    enum ReadKind { GRID, PRODUCER, EMITTER, PATTERN, INPUT_METADATA, FUZZY, INPUT_VALIDITY, INPUT_REMAINDER, OTHER }
     private final Object monitor = new Object();
     private final Thread serverThread = Thread.currentThread();
     private final LongSupplier clock;
+    private final java.util.function.BooleanSupplier cancelled;
     private volatile boolean granted;
     private volatile long deadline;
     private boolean waiting;
     private boolean finished;
     private int depth;
     private long waitNanos, exclusiveNanos, intervalStart, intervals, reads;
+    private final long[] readKinds = new long[ReadKind.values().length];
 
     NativeVmAccess() { this(System::nanoTime); }
-    NativeVmAccess(LongSupplier clock) { this.clock = clock; }
+    NativeVmAccess(LongSupplier clock) { this(clock, () -> false); }
+    NativeVmAccess(LongSupplier clock, java.util.function.BooleanSupplier cancelled) {
+        this.clock = clock; this.cancelled = cancelled;
+    }
 
     void checkpoint() {
-        if (Thread.currentThread().isInterrupted()) throw new CancellationException("VM calculation cancelled");
+        if (Thread.currentThread().isInterrupted() || cancelled.getAsBoolean()) throw new CancellationException("VM calculation cancelled");
         if (depth == 0 && granted && clock.getAsLong() - deadline >= 0) {
             synchronized (monitor) { release(); }
         }
     }
 
+    boolean readWindowExpired() {
+        return granted && clock.getAsLong() - deadline >= 0;
+    }
+
     <T> T read(Supplier<T> callback) {
+        return read(ReadKind.OTHER, callback);
+    }
+
+    <T> T read(ReadKind kind, Supplier<T> callback) {
         checkpoint();
         // Construction and synchronous test/oracle callers already own the world.
         if (Thread.currentThread() == serverThread) return callback.get();
+        if (depth > 0) return callback.get();
         synchronized (monitor) {
             if (finished) throw new CancellationException("VM calculation finished");
             if (!granted) {
@@ -49,6 +64,7 @@ final class NativeVmAccess {
         }
         depth++;
         reads++;
+        readKinds[kind.ordinal()]++;
         try { return callback.get(); }
         finally {
             depth--;
@@ -90,12 +106,21 @@ final class NativeVmAccess {
         }
     }
 
-    Metrics metrics() {
+    public Metrics metrics() {
         synchronized (monitor) {
             return new Metrics(waitNanos, exclusiveNanos + (granted ? clock.getAsLong() - intervalStart : 0),
                     intervals, reads);
         }
     }
 
-    record Metrics(long waitNanos, long exclusiveNanos, long intervals, long reads) { }
+    public String readKindSummary() {
+        var result = new java.util.StringJoiner(",", "{", "}");
+        for (var kind : ReadKind.values()) {
+            long count = readKinds[kind.ordinal()];
+            if (count != 0) result.add(kind.name() + ":" + count);
+        }
+        return result.toString();
+    }
+
+    record Metrics(long waitNanos, long exclusiveNanos, long intervals, long reads) implements NativeVmTiming.ReadMetrics { }
 }

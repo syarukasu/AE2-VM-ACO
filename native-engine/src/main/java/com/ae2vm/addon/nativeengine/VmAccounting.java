@@ -16,6 +16,12 @@ public interface VmAccounting {
     Stock exactStock(IGrid grid);
     ICraftingPlan wideResult(IGrid grid, Level level, NativeVmResult result);
 
+    /** Capture submission-validation metadata with the order, not after worker computation. */
+    default Object orderContext(IGrid grid, Level level) { return null; }
+    default ICraftingPlan wideResult(IGrid grid, Level level, NativeVmResult result, Object orderContext) {
+        return wideResult(grid,level,result);
+    }
+
     default Stock requestStock(IGrid grid, IActionSource source, boolean simulateExtraction) {
         if (source == null) return new Stock(Map.of(), true, Set.of());
         var stock = exactStock(grid);

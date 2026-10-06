@@ -11,13 +11,19 @@ import java.util.*;
 public final class VmSimulationState {
     private final VmKeyCounter stock;
     private final Map<AEKey, BigInteger> initial;
+    private final boolean complete;
     private VmByteCost bytes = VmByteCost.ZERO;
     public VmSimulationState(Map<AEKey, BigInteger> initial) {
+        this(initial, true);
+    }
+    public VmSimulationState(Map<AEKey, BigInteger> initial, boolean complete) {
         this.initial = Map.copyOf(initial);
+        this.complete = complete;
         if (initial.values().stream().anyMatch(v -> v.signum() < 0)) throw new IllegalArgumentException("Negative initial stock");
         stock = new VmKeyCounter(initial);
     }
     public Map<AEKey, BigInteger> initialStock() { return initial; }
+    public boolean complete() { return complete; }
     public BigInteger available(AEKey key) { return stock.get(key); }
     public BigInteger extract(AEKey key, BigInteger amount, Actionable mode) {
         if (amount.signum() < 0) throw new IllegalArgumentException("Negative extraction");

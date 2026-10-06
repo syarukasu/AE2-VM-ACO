@@ -22,7 +22,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 public abstract class NativeCraftingServiceMixin implements com.ae2vm.addon.nativeengine.NativeVmHook {
     @Shadow @Final private IGrid grid;
     @Shadow @Final private static java.util.concurrent.ExecutorService CRAFTING_POOL;
-
     @Override public void vm$execute(Runnable calculation) { CRAFTING_POOL.execute(calculation); }
 
     @Inject(method = "beginCraftingCalculation", at = @At("HEAD"), cancellable = true, require = 1)

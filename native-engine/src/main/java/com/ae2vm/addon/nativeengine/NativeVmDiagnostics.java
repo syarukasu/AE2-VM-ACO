@@ -63,11 +63,16 @@ final class NativeVmDiagnostics {
     }
 
     synchronized void running(long order, Object output, long work, long elapsedMillis) {
+        running(order, output, work, elapsedMillis, () -> "");
+    }
+
+    synchronized void running(long order, Object output, long work, long elapsedMillis,
+            java.util.function.Supplier<String> timing) {
         long now = clock.getAsLong();
         if (elapsedMillis >= SLOW_MILLIS && now - lastRunning >= DETAIL_INTERVAL) {
             lastRunning = now;
-            log.info("AE2-VM event=running order={} output={} work={} elapsedMs={}",
-                    order, output, work, elapsedMillis);
+            log.info("AE2-VM event=running order={} output={} work={} elapsedMs={} {}",
+                    order, output, work, elapsedMillis, timing.get());
         }
         summarize();
     }

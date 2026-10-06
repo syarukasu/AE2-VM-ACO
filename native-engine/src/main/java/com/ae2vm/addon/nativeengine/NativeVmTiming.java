@@ -5,6 +5,13 @@ import java.util.function.LongSupplier;
 
 /** #217: per-order timings only; no world references or per-instruction clocks. */
 final class NativeVmTiming {
+    interface ReadMetrics {
+        long waitNanos(); long exclusiveNanos(); long intervals(); long reads();
+    }
+    interface AccessObservation {
+        ReadMetrics metrics(); String readKindSummary();
+    }
+    private record EmptyMetrics(long waitNanos, long exclusiveNanos, long intervals, long reads) implements ReadMetrics { }
     enum Phase { STOCK, PREPARE, VM, VALIDATE, FINALIZE }
     enum ServerCall { STOCK, CATALOG, PRODUCERS, INPUTS, EMITTERS, VALIDATE, FINALIZE, OTHER }
     private final LongSupplier clock;
@@ -13,14 +20,19 @@ final class NativeVmTiming {
     private final long[] queueByKind = new long[ServerCall.values().length];
     private final java.util.Map<String, Long> patternTypes = new java.util.LinkedHashMap<>();
     private long otherPatternTypes;
+    private final java.util.Map<String, Long> remainderKeys = new java.util.LinkedHashMap<>();
+    private long remainderCalls, remainderNull, otherRemainderCalls;
     private long queued, server, blocked, handoffs, vmActive;
     private long copies, branchTrials, branchEntries, aggregatedBlocks;
     private boolean ae2Scheduled;
+    private boolean graphScheduled;
     private long cpuStarted = -1;
-    private java.util.function.Supplier<NativeVmAccess.Metrics> accessMetrics;
+    private java.util.function.Supplier<ReadMetrics> accessMetrics;
+    private java.util.function.Supplier<String> accessReadKinds;
 
-    void ae2Scheduled(NativeVmAccess access) {
+    void ae2Scheduled(AccessObservation access) {
         accessMetrics = access::metrics;
+        accessReadKinds = access::readKindSummary;
         ae2Scheduled();
     }
 
@@ -28,6 +40,8 @@ final class NativeVmTiming {
         ae2Scheduled = true;
         cpuStarted = java.lang.management.ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime();
     }
+
+    void graphScheduled() { ae2Scheduled(); graphScheduled = true; }
 
     NativeVmTiming() { this(System::nanoTime); }
     NativeVmTiming(LongSupplier clock) { this.clock = clock; }
@@ -71,6 +85,15 @@ final class NativeVmTiming {
             patternTypes.merge(bounded, 1L, Long::sum);
         else otherPatternTypes++;
     }
+    synchronized void remainderRead(String inputClass, String itemId, boolean noReturn) {
+        remainderCalls++;
+        if (noReturn) remainderNull++;
+        String label = inputClass + "/" + itemId;
+        label = label.substring(0, Math.min(120, label.length()));
+        if (remainderKeys.containsKey(label) || remainderKeys.size() < 12)
+            remainderKeys.merge(label, 1L, Long::sum);
+        else otherRemainderCalls++;
+    }
     synchronized void unblocked(long started) { blocked += now() - started; }
     synchronized void execution(long copies, long branchTrials, long branchEntries) {
         execution(copies, branchTrials, branchEntries, 0);
@@ -89,19 +112,22 @@ final class NativeVmTiming {
         return result.toString();
     }
     synchronized String summary() {
-        var access = accessMetrics == null ? new NativeVmAccess.Metrics(0, 0, 0, 0) : accessMetrics.get();
+        var access = accessMetrics == null ? new EmptyMetrics(0, 0, 0, 0) : accessMetrics.get();
         var types = new java.util.StringJoiner(",", "{", "}");
         patternTypes.forEach((name, count) -> types.add(name + ":" + count));
+        var remainders = new java.util.StringJoiner(",", "{", "}");
+        remainderKeys.forEach((name, count) -> remainders.add(name + ":" + count));
         return "stockMs=" + ms(phases[Phase.STOCK.ordinal()])
                 + " prepareMs=" + ms(phases[Phase.PREPARE.ordinal()])
                 + " vmMs=" + ms(phases[Phase.VM.ordinal()])
-                + " vmActiveMs=" + (ae2Scheduled ? -1 : ms(vmActive))
+                + " vmActiveMs=" + (ae2Scheduled && !graphScheduled ? -1 : ms(vmActive))
                 + " vmCpuMs=" + (cpuStarted < 0 ? -1 : ms(Math.max(0,
                         java.lang.management.ManagementFactory.getThreadMXBean().getCurrentThreadCpuTime() - cpuStarted)))
-                + " scheduler=" + (accessMetrics != null ? "ae2-boundary" : ae2Scheduled ? "ae2" : "detached")
+                + " scheduler=" + (graphScheduled ? "ae2-pool-snapshot" : accessMetrics != null ? "ae2-boundary" : ae2Scheduled ? "ae2" : "detached")
                 + " ae2WorldWaitMs=" + ms(access.waitNanos())
                 + " ae2ExclusiveMs=" + ms(access.exclusiveNanos())
                 + " ae2Intervals=" + access.intervals() + " ae2Reads=" + access.reads()
+                + " ae2ReadKinds=" + (accessReadKinds == null ? "{}" : accessReadKinds.get())
                 + " validateMs=" + ms(phases[Phase.VALIDATE.ordinal()])
                 + " finalizeMs=" + ms(phases[Phase.FINALIZE.ordinal()])
                 + " serverQueueMs=" + ms(queued) + " serverWorkMs=" + ms(server)
@@ -109,6 +135,8 @@ final class NativeVmTiming {
                 + " serverCalls=" + categories(calls, false)
                 + " serverQueueByKindMs=" + categories(queueByKind, true)
                 + " patternTypes=" + types + " otherPatternTypes=" + otherPatternTypes
+                + " remainderCalls=" + remainderCalls + " remainderNull=" + remainderNull
+                + " remainderKeys=" + remainders + " otherRemainderCalls=" + otherRemainderCalls
                 + " stateCopies=" + copies + " branchTrials=" + branchTrials
                 + " branchEntries=" + branchEntries + " aggregatedBlocks=" + aggregatedBlocks;
     }

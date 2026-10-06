@@ -12,15 +12,21 @@ import net.minecraft.world.level.Level;
 /** Uses AE2's pool and tick hook; only live reads wait for an exclusive interval. */
 public final class NativeVmCalculation extends CraftingCalculation {
     private final Level world;
-    private final NativeVmAccess access = new NativeVmAccess();
+    private final NativeVmAccess access;
     private final java.util.function.Function<NativeVmAccess, ICraftingPlan> calculation;
 
     NativeVmCalculation(Level level, IGrid grid, AEKey output, CalculationStrategy strategy,
             java.util.function.Function<NativeVmAccess, ICraftingPlan> calculation) {
+        this(level, grid, output, strategy, new NativeVmAccess(), calculation);
+    }
+
+    NativeVmCalculation(Level level, IGrid grid, AEKey output, CalculationStrategy strategy,
+            NativeVmAccess access, java.util.function.Function<NativeVmAccess, ICraftingPlan> calculation) {
         // Scheduling only: null action source skips AE2's second stock snapshot.
         // The placeholder is never executed. The VM receives the original BigInteger request.
         super(level, grid, () -> null, new GenericStack(output, 1), strategy);
         world = level;
+        this.access = access;
         this.calculation = calculation;
     }
 

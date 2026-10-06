@@ -6,6 +6,8 @@ import com.ae2vm.addon.compiler.PatternCompiler;
 import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.CancellationException;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 /** #218: shared recipe demands, not a multiplied snapshot of one inventory trial. */
 final class VmDemandProgram {
@@ -15,7 +17,7 @@ final class VmDemandProgram {
     final Map<AEKey, Leaf> leaves = new LinkedHashMap<>();
     final Set<AEKey> intermediates = new LinkedHashSet<>(), dependencies = new HashSet<>();
     final IPatternDetails pattern;
-    final int generation;
+    int generation;
     final List<VmDemandProgram> children = new ArrayList<>();
     private final Set<AEKey> inputs = new HashSet<>(), secondary = new HashSet<>();
     BigInteger nodes = ZERO, period = ONE;
@@ -45,24 +47,98 @@ final class VmDemandProgram {
     /** Only already-demanded immutable definitions are visible to this compiler. */
     static final class Compiler {
         private final Map<AEKey, List<IPatternDetails>> known;
+        private final Function<AEKey, List<IPatternDetails>> resolver;
         private final Map<IPatternDetails, VmDemandProgram> programs = new IdentityHashMap<>();
         private final Map<IPatternDetails, Integer> unavailable = new IdentityHashMap<>();
         private final Set<IPatternDetails> visiting = Collections.newSetFromMap(new IdentityHashMap<>());
         private final Runnable control;
-        Compiler(Map<AEKey, List<IPatternDetails>> known) { this(known, () -> { }); }
+        private Set<AEKey> stockBoundaries = Set.of();
+        private final Map<IPatternDetails, Map<Set<AEKey>, StockedProgram>> stockedPrograms = new IdentityHashMap<>();
+        private record StockedProgram(VmDemandProgram program, int generation) { }
+        Compiler(Map<AEKey, List<IPatternDetails>> known) { this(known, null, () -> { }); }
         Compiler(Map<AEKey, List<IPatternDetails>> known, Runnable control) {
-            this.known = known; this.control = control;
+            this(known, null, control);
+        }
+        Compiler(Map<AEKey, List<IPatternDetails>> known,
+                Function<AEKey, List<IPatternDetails>> resolver, Runnable control) {
+            this.known = known; this.resolver = resolver; this.control = control;
         }
         private void checkpoint() {
             VmDemandProgram.checkpoint();
             control.run();
         }
 
+        VmDemandProgram stocked(VmDemandProgram original, Predicate<AEKey> supplied) {
+            var boundaries = new HashSet<AEKey>();
+            for (var key : original.intermediates) if (supplied.test(key)) boundaries.add(key);
+            if (boundaries.isEmpty()) return original;
+            var variants = stockedPrograms.computeIfAbsent(original.pattern,
+                    ignored -> new LinkedHashMap<>(16, 0.75f, true));
+            var cached = variants.get(boundaries);
+            if (cached != null && cached.generation == known.size())
+                return cached.program;
+            // #218: stop at actual stock, not at a permanently uncraftable leaf.
+            var compiler = new Compiler(known, null, control);
+            compiler.stockBoundaries = Set.copyOf(boundaries);
+            var result = compiler.get(original.pattern);
+            variants.put(compiler.stockBoundaries, new StockedProgram(result, known.size()));
+            // Bound retained summaries, never quantities or the amount of planning work.
+            if (variants.size() > 32) variants.remove(variants.keySet().iterator().next());
+            return result;
+        }
+
+        VmDemandProgram getExpanded(IPatternDetails pattern, Predicate<AEKey> stocked) {
+            if (resolver == null) return get(pattern);
+            var path = Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>());
+            var complete = Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>());
+            if (!expandUnique(pattern, stocked, path, complete)) return null;
+            return get(pattern);
+        }
+
+        private boolean expandUnique(IPatternDetails pattern, Predicate<AEKey> stocked,
+                Set<IPatternDetails> path,
+                Set<IPatternDetails> complete) {
+            checkpoint();
+            if (complete.contains(pattern)) return true;
+            if (pattern.getOutputs().length != 1) return false;
+            if (!path.add(pattern)) return false;
+            try {
+                for (var slot : pattern.getInputs()) {
+                    checkpoint();
+                    if (!(slot instanceof PatternCompiler.DetachedInput exact)) return false;
+                    var templates = slot.getPossibleInputs();
+                    if (templates.length != 1 || !exact.isCandidatePrepared(templates[0].what())) return false;
+                    var key = exact.exactKey();
+                    if (key == null || !key.equals(templates[0].what()) || !key.equals(exact.craftedKey()))
+                        return false;
+                    if (exact.emittable()) continue;
+                    // A stocked leaf needs no producer lookup. Compilation records it as
+                    // stock-only; the caller resolves it if its demand exceeds that stock.
+                    if (stocked.test(key)) continue;
+                    var choices = known.computeIfAbsent(key, resolver);
+                    if (choices.size() > 1) return false;
+                    if (choices.size() == 1) {
+                        var producer = choices.get(0);
+                        if (!producer.getPrimaryOutput().what().equals(key)
+                                || !expandUnique(producer, stocked, path, complete)) return false;
+                    }
+                }
+                complete.add(pattern);
+                return true;
+            } finally { path.remove(pattern); }
+        }
+
         VmDemandProgram get(IPatternDetails pattern) {
             checkpoint();
             var cached = programs.get(pattern);
-            if (cached != null && (cached.generation == known.size()
-                    || cached.leaves.values().stream().noneMatch(Leaf::stockOnly))) return cached;
+            if (cached != null) {
+                if (cached.generation == known.size()
+                        || cached.leaves.values().stream().noneMatch(Leaf::stockOnly)) return cached;
+                if (!unresolvedLeafResolved(cached)) {
+                    refreshGeneration(cached, known.size());
+                    return cached;
+                }
+            }
             if (Objects.equals(unavailable.get(pattern), known.size()) || !visiting.add(pattern)) return null;
             VmDemandProgram result;
             try { result = compile(pattern); }
@@ -72,13 +148,27 @@ final class VmDemandProgram {
             return result;
         }
 
+        private boolean unresolvedLeafResolved(VmDemandProgram program) {
+            for (var entry : program.leaves.entrySet()) {
+                if (!entry.getValue().stockOnly()) continue;
+                if (known.containsKey(entry.getKey())) return true;
+            }
+            return false;
+        }
+
+        private void refreshGeneration(VmDemandProgram program, int generation) {
+            if (program.generation == generation) return;
+            program.generation = generation;
+            for (var child : program.children) if (child != null) refreshGeneration(child, generation);
+        }
+
         private VmDemandProgram compile(IPatternDetails pattern) {
             var result = new VmDemandProgram(pattern, known.size());
             result.crafts.put(pattern, Ratio.of(ONE));
             result.bytes = new VmByteCost(ONE, ONE);
             var primary = pattern.getPrimaryOutput().what();
             for (var output : pattern.getOutputs()) {
-                merge(result.outputs, output.what(), Ratio.of(BigInteger.valueOf(output.amount())));
+                merge(result.outputs, output.what(), Ratio.of(PatternCompiler.outputAmount(pattern, output)));
                 result.dependencies.add(output.what());
                 if (!output.what().equals(primary)) result.secondary.add(output.what());
             }
@@ -90,14 +180,15 @@ final class VmDemandProgram {
                 var key = exact.exactKey();
                 if (key == null || !key.equals(templates[0].what()) || !key.equals(exact.craftedKey())) return null;
                 var unit = BigInteger.valueOf(templates[0].amount());
-                var amount = unit.multiply(BigInteger.valueOf(slot.getMultiplier()));
+                var amount = unit.multiply(PatternCompiler.inputMultiplier(slot));
                 result.nodes = result.nodes.add(ONE);
                 result.inputs.add(key); result.dependencies.add(key);
                 result.bytes = result.bytes.add(new VmByteCost(amount.multiply(BigInteger.valueOf(8)),
                         BigInteger.valueOf(key.getType().getAmountPerByte())));
                 var choices = known.get(key);
-                if (exact.emittable() || choices == null || choices.isEmpty()) {
-                    var leaf = new Leaf(unit, exact.emittable(), !exact.emittable() && choices == null);
+                if (exact.emittable() || stockBoundaries.contains(key) || choices == null || choices.isEmpty()) {
+                    var leaf = new Leaf(unit, exact.emittable(), !exact.emittable()
+                            && (choices == null || stockBoundaries.contains(key)));
                     var previous = result.leaves.putIfAbsent(key, leaf);
                     if (previous != null && !previous.equals(leaf)) return null;
                     merge(result.needs, key, Ratio.of(amount));
@@ -111,7 +202,7 @@ final class VmDemandProgram {
                 if (child == null) return null;
                 result.children.add(child);
                 BigInteger output = ZERO;
-                for (var stack : producer.getOutputs()) if (stack.what().equals(key)) output = output.add(BigInteger.valueOf(stack.amount()));
+                for (var stack : producer.getOutputs()) if (stack.what().equals(key)) output = output.add(PatternCompiler.outputAmount(producer, stack));
                 if (output.signum() <= 0) return null;
                 var ratio = new Ratio(amount, output);
                 result.nodes = result.nodes.add(child.nodes);
@@ -132,7 +223,8 @@ final class VmDemandProgram {
                 result.period = lcm(result.period, ratio.denominator().multiply(child.period)
                         .divide(ratio.numerator().gcd(ratio.denominator().multiply(child.period))));
             }
-            if (!Collections.disjoint(result.inputs, result.secondary) || result.inputs.contains(primary)) return null;
+            if (!Collections.disjoint(result.inputs, result.secondary)
+                    || result.inputs.contains(primary) || result.secondary.contains(primary)) return null;
             result.outputs.entrySet().removeIf(entry -> entry.getValue().numerator().signum() == 0);
             if (result.outputs.values().stream().anyMatch(value -> value.numerator().signum() < 0)) return null;
             return result;

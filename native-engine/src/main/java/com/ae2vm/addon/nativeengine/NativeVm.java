@@ -25,7 +25,7 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.Level;
 import org.slf4j.Logger;
 
-/** VM arithmetic under AE2's own lifecycle. No detached capture or retry layer. */
+/** One order stock snapshot, the BigInteger VM, and AE2's existing worker pool. */
 public final class NativeVm {
     private static final Logger LOG = LogUtils.getLogger();
     private static final NativeVmDiagnostics DIAGNOSTICS = new NativeVmDiagnostics(LOG, System::nanoTime,
@@ -61,9 +61,10 @@ public final class NativeVm {
         var server = Objects.requireNonNull(level.getServer());
         if (requested.signum() <= 0) throw new IllegalArgumentException("positive VM order required");
         long order = ORDERS.incrementAndGet(), started = System.nanoTime();
-        var job = new AtomicReference<NativeVmCalculation>();
+        DIAGNOSTICS.started();
+        var job = new AtomicReference<java.util.concurrent.Callable<ICraftingPlan>>();
         class OrderTask extends FutureTask<ICraftingPlan> {
-            OrderTask() { super(() -> job.get().run()); }
+            OrderTask() { super(() -> job.get().call()); }
             @Override protected void done() { ACTIVE.remove(this); }
             void fail(Throwable failure) { setException(failure); }
         }
@@ -81,11 +82,31 @@ public final class NativeVm {
                     stock = requestStock(grid, requester, extension);
                 }
                 if (task.isCancelled()) return;
-                job.set(new NativeVmCalculation(level, grid, output, strategy,
-                        access -> compute(order, started, grid, level, requester, output, requested,
-                                strategy, extension, stock, timing, access)));
+                var access = new NativeVmAccess(System::nanoTime, task::isCancelled);
+                var context = new NativeVmPlanningContext(grid, level, requester, stock, access, timing);
+                Object orderContext;
+                try (var span = timing.phase(NativeVmTiming.Phase.PREPARE)) {
+                    context.prepare(output);
+                    orderContext = extension == null ? null : extension.orderContext(grid,level);
+                }
+                if (task.isCancelled()) return;
+                java.util.function.Function<NativeVmAccess, ICraftingPlan> compute = owner ->
+                        compute(order, started, grid, level, output, requested,
+                                strategy, extension, context, orderContext, timing, owner);
+                if (context.requiresLiveAccess()) {
+                    var calculation = new NativeVmCalculation(level, grid, output, strategy, access, compute);
+                    job.set(calculation::run);
+                } else {
+                    // Frozen exact inputs need neither AE2's placeholder tree nor its live-read tick registration.
+                    job.set(() -> { try { return compute.apply(access); } finally { access.finish(); } });
+                }
                 hook.vm$execute(task);
-            } catch (Throwable failure) { task.fail(failure); }
+            } catch (Throwable failure) {
+                if (failure instanceof CancellationException) DIAGNOSTICS.cancelled();
+                else DIAGNOSTICS.failed(order, output.getId(), requested,
+                        failure instanceof RuntimeException runtime ? runtime : new IllegalStateException(failure));
+                task.fail(failure);
+            }
         };
         // Off-thread API callers queue creation once, never one task per ingredient.
         if (server.isSameThread()) initialize.run();
@@ -116,14 +137,13 @@ public final class NativeVm {
     }
 
     static ICraftingPlan compute(long order, long started, IGrid grid, Level level,
-            ICraftingSimulationRequester requester, AEKey output, BigInteger request, CalculationStrategy strategy,
-            VmAccounting extension, VmAccounting.Stock stock, NativeVmTiming timing, NativeVmAccess access) {
-        DIAGNOSTICS.started();
+            AEKey output, BigInteger request, CalculationStrategy strategy,
+            VmAccounting extension, NativeVmPlanningContext context, Object orderContext,
+            NativeVmTiming timing, NativeVmAccess access) {
         timing.ae2Scheduled(access);
         try {
-            var context = new NativeVmPlanningContext(grid, level, requester, stock, access, timing);
             var result = context.plan(output, request, strategy == CalculationStrategy.CRAFT_LESS,
-                    work -> DIAGNOSTICS.running(order, output.getId(), work, elapsed(started)));
+                    work -> DIAGNOSTICS.running(order, output.getId(), work, elapsed(started), timing::summary));
             BigInteger bytes = bytes(result);
             boolean wide = result.requested().bitLength() > 63
                     || wide(result.crafts()) || wide(result.used()) || wide(result.missing()) || wide(result.emitted())
@@ -133,7 +153,7 @@ public final class NativeVm {
             try (var span = timing.phase(NativeVmTiming.Phase.FINALIZE)) {
                 if (exact.wide()) {
                     if (extension == null) throw new IllegalStateException("wide VM result requires an exact accounting owner");
-                    plan = extension.wideResult(grid, level, exact);
+                    plan = extension.wideResult(grid, level, exact, orderContext);
                 } else plan = ordinaryPlan(exact);
             }
             String profile = timing.summary();
