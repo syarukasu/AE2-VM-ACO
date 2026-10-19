@@ -43,37 +43,9 @@
 
 ---
 
-## 测试与基准（版本 1.10.7）
+## 已知限制
 
-> 以下数据来自 `gradlew.bat cleanTest test --no-daemon`（BUILD SUCCESSFUL），未编造。
-
-```
-测试类: 18    用例: 136    失败: 0    错误: 0    跳过: 0
-构建: BUILD SUCCESSFUL
-闪电基准: cases=39 supported=38 falsePositive=1 engineError=0 timeout=0
-边界基准: cases=37 ok=37 feasible=36
-```
-
-### 闪电基准（Thunderbolt-Core 参考能力，39 例）
-
-13 图族 × 3 材料模式（MISSING / MINIMUM / UNBOUNDED），13 图族全部 SUPPORTED：
-
-| 图族 | 状态 |
-|---|---|
-| 单配方 DAG（dispersed / fibonacci） | ✅ SUPPORTED |
-| 多配方 DAG（greedy-trap / fibonacci） | ✅ SUPPORTED（fibonacci/minimum 为唯一 FALSE_POSITIVE） |
-| 环裁切（conversion-ring / self-growth-cut） | ✅ SUPPORTED |
-| 催化剂 / 反馈环（returned-seed / raw / lossy） | ✅ 9/9 SUPPORTED |
-| 耐久链（finite-use-chain） | ✅ 3/3 SUPPORTED |
-| 模糊 / 可复用库存（variant-route） | ✅ 3/3 SUPPORTED |
-| 递归 / 自引用（amplifier / essence-catalyst） | ✅ 6/6 SUPPORTED |
-
-> 唯一剩余 FALSE_POSITIVE：`multi-dag/fibonacci/minimum`（多样板最优选择），需全局优化器（BoundedCombinations / 线性求解器），非引擎错误。
-
-### 边界能力基准（37 例）
-
-`craftable-primary-white-stock amt=100 (white=1)` 修复前 `missing={white_wool=99}` → 修复后 `missing={}`；
-全部 37 例与期望可行性一致（36 可行 + 1 不可行 sanity）。
+上游记录了 `multi-dag/fibonacci/minimum` 的假可行结果；多样板最优选择尚未解决。
 
 ---
 
@@ -237,12 +209,12 @@ src/main/java/com/ae2vm/addon/
 ```bash
 set JAVA_HOME=D:\Java26   # 需要 Java 26 / 25（Gradle 9.7.0）
 
-# 双版本构建（推荐）：版本 +0.0.1 → 构建 crash 版 → 构建 warn 版 → 两个 jar 都复制到 mods
+# 双版本构建（推荐）：版本 +0.0.1 → 构建 crash 版 → 构建 warn 版 → 两个 jar 保留在 build/libs
 buildBoth.bat
 
 # 或单次构建
-.\gradlew.bat -PblockedMode=crash jar copyJarToMods --no-daemon   # 针对检测版
-.\gradlew.bat -PblockedMode=warn   jar copyJarToMods --no-daemon   # 无针对检测版
+.\gradlew.bat -PblockedMode=crash jar --no-daemon   # 针对检测版
+.\gradlew.bat -PblockedMode=warn   jar --no-daemon   # 无针对检测版
 
 # 输出（<ver> = 当前版本，如 1.10.7；带 _neoforge_26.1.2 后缀）
 # build/libs/ae2vm-<ver>_neoforge_26.1.2.jar            （针对检测版）
@@ -250,3 +222,5 @@ buildBoth.bat
 ```
 
 > 每次编译 `mod_version` 自动 +0.0.1（基于 1.9.0）。`copyJarToMods` 会先删除旧版本 jar 再复制。
+
+将 Thunderbolt-Core API JAR 放在 `libs/thunderbolt-1.0.0.jar`，或使用 `-PthunderboltJar=/path/to/thunderbolt.jar`。构建不再删除或复制本地 Minecraft 安装中的文件。

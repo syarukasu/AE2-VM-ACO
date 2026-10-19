@@ -42,36 +42,9 @@
 
 ---
 
-## Tests & Benchmark (version 1.10.7)
+## Known Limitations
 
-> Data from `gradlew.bat cleanTest test --no-daemon` (BUILD SUCCESSFUL), not fabricated.
-
-```
-Test classes: 18    Cases: 136    Failures: 0    Errors: 0    Skipped: 0
-Build: BUILD SUCCESSFUL
-Lightning benchmark: cases=39 supported=38 falsePositive=1 engineError=0 timeout=0
-Boundary benchmark:  cases=37 ok=37 feasible=36
-```
-
-### Lightning benchmark (Thunderbolt-Core reference capability, 39 cases)
-
-13 graph families × 3 material modes (MISSING / MINIMUM / UNBOUNDED), all 13 families SUPPORTED:
-
-| Family | Status |
-|---|---|
-| Single-pattern DAG (dispersed / fibonacci) | ✅ SUPPORTED |
-| Multi-pattern DAG (greedy-trap / fibonacci) | ✅ SUPPORTED (fibonacci/minimum is the only FALSE_POSITIVE) |
-| Cycle cutting (conversion-ring / self-growth-cut) | ✅ SUPPORTED |
-| Catalyst / feedback loops (returned-seed / raw / lossy) | ✅ 9/9 SUPPORTED |
-| Durability chain (finite-use-chain) | ✅ 3/3 SUPPORTED |
-| Fuzzy / reusable stock (variant-route) | ✅ 3/3 SUPPORTED |
-| Recursion / self-reference (amplifier / essence-catalyst) | ✅ 6/6 SUPPORTED |
-
-> The only remaining FALSE_POSITIVE: `multi-dag/fibonacci/minimum` (optimal multi-pattern selection needs a global optimizer — BoundedCombinations / linear solver), not an engine error.
-
-### Boundary benchmark (37 cases)
-
-`craftable-primary-white-stock amt=100 (white=1)`: before the fix `missing={white_wool=99}`, after `missing={}`; all 37 cases match expected feasibility (36 feasible + 1 infeasible sanity).
+Upstream reports a false-positive plan for `multi-dag/fibonacci/minimum`; optimal multi-pattern selection remains unresolved.
 
 ---
 
@@ -235,12 +208,12 @@ src/main/java/com/ae2vm/addon/
 ```bash
 set JAVA_HOME=D:\Java26   # requires Java 26 / 25 (Gradle 9.7.0)
 
-# Dual build (recommended): version +0.0.1 → crash build → warn build → both jars to mods
+# Dual build (recommended): version +0.0.1 → crash build → warn build → both jars in build/libs
 buildBoth.bat
 
 # Single build
-.\gradlew.bat -PblockedMode=crash jar copyJarToMods --no-daemon   # detection build
-.\gradlew.bat -PblockedMode=warn   jar copyJarToMods --no-daemon   # no-detection build
+.\gradlew.bat -PblockedMode=crash jar --no-daemon   # detection build
+.\gradlew.bat -PblockedMode=warn   jar --no-daemon   # no-detection build
 
 # Output (<ver> = current version, e.g. 1.10.7; with _neoforge_26.1.2 suffix)
 # build/libs/ae2vm-<ver>_neoforge_26.1.2.jar            (crashes on incompatible author mods)
@@ -248,3 +221,5 @@ buildBoth.bat
 ```
 
 > Each build bumps `mod_version` by +0.0.1 (based on 1.9.0). `copyJarToMods` removes old jars first.
+
+Supply the Thunderbolt-Core API JAR at `libs/thunderbolt-1.0.0.jar`, or pass `-PthunderboltJar=/path/to/thunderbolt.jar`. Builds no longer delete or copy files in a local Minecraft installation.

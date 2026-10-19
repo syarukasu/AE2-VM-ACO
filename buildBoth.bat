@@ -17,17 +17,17 @@ if errorlevel 1 goto :error
 
 echo.
 echo === [2/3] Build CRASH variant (ae2vm / 针对检测) ===
-call gradlew.bat -PblockedMode=crash jar copyJarToMods --no-daemon
+call gradlew.bat -PblockedMode=crash jar --no-daemon
 if errorlevel 1 goto :error
 
 echo.
 echo === [3/3] Build WARN variant (ae2vm-nodetect / 无针对检测) ===
-call gradlew.bat -PblockedMode=warn jar copyJarToMods --no-daemon
+call gradlew.bat -PblockedMode=warn jar --no-daemon
 if errorlevel 1 goto :error
 
 echo.
 echo ============================================================
-echo  Build OK — 两个 jar 已复制到 mods 文件夹：
+echo  Build OK — 两个 jar 已生成到 build/libs：
 echo   - ae2vm-<version>.jar            （针对检测，会闪退）
 echo   - ae2vm-nodetect-<version>.jar   （无针对检测，只警告）
 echo  启动游戏前只保留其中一个！

@@ -53,37 +53,15 @@ dependencies {
     // Thunderbolt-Core（弱依赖 / 可选前置，compileOnly）：未安装也能正常运行。
     // 装了且通过 /thunderbolt engine ae2vm 选中本引擎时，才把 AE2 合成计算路由到 VM；
     // 未选中则不走 VM（交给 Thunderbolt/原版）。neoforge.mods.toml 不声明硬依赖。
-    compileOnly files('E:/TB ThirdParty/Thunderbolt-Core/build/libs/thunderbolt-1.0.0.jar')
+    compileOnly files(providers.gradleProperty('thunderboltJar').getOrElse('libs/thunderbolt-1.0.0.jar'))
 
-    testImplementation 'org.spongepowered:mixin:0.8.5'
-    testImplementation platform('org.junit:junit-bom:5.10.2')
-    testImplementation 'org.junit.jupiter:junit-jupiter-api'
-    testRuntimeOnly 'org.junit.jupiter:junit-jupiter-engine'
-    // (v1.10.4+ MC26.1.2) Gradle 9 no longer auto-adds the JUnit Platform launcher.
-    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
-// Moddev 只把 moddev 生成的游戏类 + neoforge 依赖树注入 main 的编译/运行路径，
-// 不注入 test。单元测试里的 VM 桥接基准（src/test/.../bench/）要离线驱动
-// CraftingVM，需要 net.minecraft.* / com.mojang.*（DFU/brigadier 等），
-// 因此把 main 的完整类路径接给 test。
-afterEvaluate {
-    sourceSets.test.compileClasspath += sourceSets.main.compileClasspath
-    sourceSets.test.runtimeClasspath += sourceSets.main.runtimeClasspath
-}
-tasks.named('compileTestJava') { dependsOn 'createMinecraftArtifacts' }
 
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
 }
 
-tasks.named('test', Test) {
-    useJUnitPlatform()
-    // 打印 [reference-capability] 结果行到控制台（AE2VM 参考能力速度基准）
-    testLogging {
-        showStandardStreams = true
-    }
-}
 
 tasks.named('processResources', ProcessResources) {
     filteringCharset = 'UTF-8' // prevent non-ASCII corruption on Windows (GBK default)
@@ -112,34 +90,4 @@ tasks.named('compileJava', JavaCompile) {
     options.compilerArgs += [
         '-Amixin.refmap=ae2vm.refmap.json'
     ]
-}
-
-// Auto-copy compiled JAR to Minecraft mods folder after build
-// Remove all old versions of this mod before copying the new one
-// 只删当前变体的旧 jar，保留另一个变体（crash 变体不会误删 nodetect 变体）
-// 属性在 doLast 外捕获成局部变量（doLast 里拿不到配置期的 mod_version/modArchiveName 值）
-tasks.register('cleanOldJars') {
-    def modsDir = java.nio.file.Path.of('E:/MC/.minecraft/versions/NAST hard d0.9.1 beta3/mods')
-    // crash 变体(ae2vm) → ae2vm-<数字>.jar；warn 变体(ae2vm-nodetect) → ae2vm-nodetect-*.jar
-    def glob = modArchiveName == 'ae2vm' ? 'ae2vm-[0-9]*.jar' : "${modArchiveName}-*.jar"
-    doLast {
-        java.nio.file.Files.newDirectoryStream(modsDir, glob).withCloseable { stream ->
-            stream.each { java.nio.file.Files.deleteIfExists(it) }
-        }
-    }
-}
-
-tasks.register('copyJarToMods', Copy) {
-    dependsOn tasks.named('jar')
-    dependsOn 'cleanOldJars'
-    from tasks.named('jar').flatMap { it.archiveFile }
-    into 'E:/MC/.minecraft/versions/NAST hard d0.9.1 beta3/mods'
-    doLast {
-        logger.lifecycle("Copied JAR to mods folder")
-    }
-}
-
-// Hook into the build lifecycle: build → copyJarToMods
-tasks.named('build') {
-    finalizedBy 'copyJarToMods'
 }
