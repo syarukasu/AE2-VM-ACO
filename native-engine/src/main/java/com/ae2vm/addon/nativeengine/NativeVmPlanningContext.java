@@ -140,32 +140,47 @@ final class NativeVmPlanningContext {
         return !catalogPrepared || !candidateDomainClosed;
     }
 
+    NativeVmBenchmark.Snapshot benchmarkSnapshot(AEKey root, BigInteger requested, boolean craftLess) {
+        // #221: only already-captured values; never resolve a new service or callback for diagnostics.
+        var emitters = emitterAnswers.get(emitterService);
+        return NativeVmBenchmark.capture(root, requested, craftLess, stock.amounts(), stock.complete(),
+                programsByKey, ids, bindings, emitters == null ? Map.of() : emitters, !requiresLiveAccess());
+    }
+
     VmQuantities plan(AEKey root, BigInteger requested, boolean craftLess, LongConsumer progress) {
-        try (var scope = PatternCompiler.openScope()) {
-            var vm = new CraftingVM(this, key -> {
-                var choices = candidates(key);
-                return choices.isEmpty() ? null : choices.get(0);
-            });
-            vm.setAllPatternsResolver(this::candidates);
-            vm.setEmitterResolver(key -> canEmit(emitterService(), key));
-            vm.setProgressListener(progress);
-            vm.setCheckpoint(checkpoint);
-            com.ae2vm.addon.vm.VmCraftingPlan result;
-            try (var span = timing.phase(NativeVmTiming.Phase.VM)) {
-                try {
-                    result = vm.execute(PatternCompiler.compileRequest(root, requested),
-                            new VmSimulationState(stock.amounts(), stock.complete()), craftLess);
-                } finally {
-                    timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries(), vm.aggregatedBlocks());
+        try (var scope = PatternCompiler.openScope(timing.detailed())) {
+            try {
+                var vm = new CraftingVM(this, key -> {
+                    var choices = candidates(key);
+                    return choices.isEmpty() ? null : choices.get(0);
+                });
+                vm.setAllPatternsResolver(this::candidates);
+                vm.setEmitterResolver(key -> canEmit(emitterService(), key));
+                vm.setProgressListener(progress);
+                vm.setCheckpoint(checkpoint);
+                com.ae2vm.addon.vm.VmCraftingPlan result;
+                try (var span = timing.phase(NativeVmTiming.Phase.VM)) {
+                    try {
+                        result = vm.execute(PatternCompiler.compileRequest(root, requested),
+                                new VmSimulationState(stock.amounts(), stock.complete()), craftLess);
+                    } finally {
+                        timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries(), vm.aggregatedBlocks());
+                        timing.vmWork(vm.instructions(), vm.work());
+                    }
                 }
+                Map<String, BigInteger> crafts = new LinkedHashMap<>();
+                result.patternTimes().forEach((pattern, count) -> crafts.merge(
+                        Objects.requireNonNull(ids.get(pattern)), count, BigInteger::add));
+                return new VmQuantities(root, result.finalOutput().amount(), crafts,
+                        result.usedItems().quantities(), result.emittedItems().quantities(),
+                        result.missingItems().quantities(), result.bytes(), Map.of(), result.multiplePaths(),
+                        vm.instructions(), vm.work(), vm.skippedIterations());
+            } finally {
+                NativeVmProfiler.observe(() -> {
+                    var stats = PatternCompiler.statistics();
+                    timing.compiler(stats.compileHits(), stats.compileMisses(), stats.fuzzyHits(), stats.fuzzyMisses());
+                });
             }
-            Map<String, BigInteger> crafts = new LinkedHashMap<>();
-            result.patternTimes().forEach((pattern, count) -> crafts.merge(
-                    Objects.requireNonNull(ids.get(pattern)), count, BigInteger::add));
-            return new VmQuantities(root, result.finalOutput().amount(), crafts,
-                    result.usedItems().quantities(), result.emittedItems().quantities(),
-                    result.missingItems().quantities(), result.bytes(), Map.of(), result.multiplePaths(),
-                    vm.instructions(), vm.work(), vm.skippedIterations());
         }
     }
 
@@ -192,8 +207,13 @@ final class NativeVmPlanningContext {
         if (service == null) return false;
         var answers = emitterAnswers.computeIfAbsent(service, ignored -> new HashMap<>());
         var known = answers.get(key);
+        timing.cache(NativeVmTiming.Cache.EMITTER, known != null);
         if (known != null) return known;
-        if (catalogPrepared) throw new IllegalStateException("Emitter key outside the order snapshot: " + key);
+        if (catalogPrepared) {
+            var failure = new IllegalStateException("Emitter key outside the order snapshot: " + key);
+            timing.failureReason("snapshot_emitter_missing", failure);
+            throw failure;
+        }
         boolean answer = access.read(ReadKind.EMITTER, () -> service.canEmitFor(key));
         answers.put(key, answer);
         return answer;
@@ -201,8 +221,13 @@ final class NativeVmPlanningContext {
 
     private List<IPatternDetails> choicesFor(ICraftingService service, AEKey key) {
         var known = producerChoices.get(key);
+        timing.cache(NativeVmTiming.Cache.PRODUCER, known != null);
         if (known != null) return known;
-        if (catalogPrepared) throw new IllegalStateException("Producer key outside the order snapshot: " + key);
+        if (catalogPrepared) {
+            var failure = new IllegalStateException("Producer key outside the order snapshot: " + key);
+            timing.failureReason("snapshot_producer_missing", failure);
+            throw failure;
+        }
         var choices = access.read(ReadKind.PRODUCER, () -> List.copyOf(service.getCraftingFor(key)));
         producerChoices.put(key, choices);
         return choices;
@@ -211,6 +236,7 @@ final class NativeVmPlanningContext {
     private List<IPatternDetails> candidates(AEKey key) {
         checkpoint.run();
         var known = programsByKey.get(key);
+        timing.cache(NativeVmTiming.Cache.PROGRAM, known != null);
         if (known != null) return known;
         var service = producerService();
         if (service == null) {
@@ -254,6 +280,14 @@ final class NativeVmPlanningContext {
 
     private record InputMetadata(GenericStack[] templates, long multiplier, boolean nativeExact, NativeCraftingRule rule) { }
 
+    private BigInteger inputAmount(AEKey key) {
+        try { return stock.amount(key); }
+        catch (IllegalStateException failure) {
+            timing.failureReason("snapshot_input_missing", failure);
+            throw failure;
+        }
+    }
+
     private record PatternSkeleton(AEItemKey definition, IPatternDetails semantics, IPatternDetails.IInput[] inputs,
             GenericStack[] outputs, BigInteger scale) { }
 
@@ -295,7 +329,7 @@ final class NativeVmPlanningContext {
             var primary = templates[0];
             boolean nativeProcessing = pattern instanceof AEProcessingPattern
                     && source.getClass().getName().equals("appeng.crafting.pattern.AEProcessingPattern$Input");
-            stock.amount(primary.what());
+            inputAmount(primary.what());
             emitted = canEmit(service, primary.what());
             boolean nativeExact = nativeCrafting && templates.length == 1 && metadata.nativeExact();
             if (nativeProcessing && templates.length == 1) {
@@ -321,7 +355,7 @@ final class NativeVmPlanningContext {
                 }
             }
             crafted = selected;
-            stock.amount(crafted);
+            inputAmount(crafted);
             prepared = true;
         }
 
@@ -365,7 +399,7 @@ final class NativeVmPlanningContext {
         }
         public boolean isValid(AEKey key, Level ignored) {
             prepare();
-            stock.amount(key);
+            inputAmount(key);
             checkpoint.run();
             if (exact != null) {
                 return exact.equals(key);
@@ -387,7 +421,9 @@ final class NativeVmPlanningContext {
 
         private void observe(AEKey key) {
             checkpoint.run();
-            if (valid.containsKey(key) || failures.containsKey(key)) return;
+            boolean known = valid.containsKey(key) || failures.containsKey(key);
+            timing.cache(NativeVmTiming.Cache.INPUT, known);
+            if (known) return;
             if (rejectsUnmatchedKeyLocally(key)) {
                 valid.put(key, false);
                 return;
@@ -445,14 +481,17 @@ final class NativeVmPlanningContext {
             if (nativeCrafting && !(key instanceof AEItemKey)) return null;
             // One order uses one pattern snapshot. Key includes item NBT, so returned tool states stay distinct.
             if (failures.containsKey(key)) throw failures.get(key);
-            if (!remainders.containsKey(key) && !observeRule(key))
+            boolean known = remainders.containsKey(key);
+            timing.cache(NativeVmTiming.Cache.REMAINDER, known);
+            if (!known && !observeRule(key))
                 remainders.put(key, access.read(ReadKind.INPUT_REMAINDER, () -> readRemainder(key)));
             return remainders.get(key);
         }
 
         private AEKey readRemainder(AEKey key) {
             var remainder = source.getRemainingKey(key);
-            timing.remainderRead(source.getClass().getName(), key.getId().toString(), remainder == null);
+            timing.remainderRead(timing.detailed() ? source.getClass().getName() : "",
+                    timing.detailed() ? key.getId().toString() : "", remainder == null);
             return remainder;
         }
     }

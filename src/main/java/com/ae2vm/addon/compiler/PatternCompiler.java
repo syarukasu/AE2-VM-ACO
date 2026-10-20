@@ -39,7 +39,10 @@ public class PatternCompiler {
       }
    }
    public interface Scope extends AutoCloseable { @Override void close(); }
+   public record Statistics(long compileHits, long compileMisses, long fuzzyHits, long fuzzyMisses) { }
    private static final class State {
+      boolean detailed;
+      long compileHits, compileMisses, fuzzyHits, fuzzyMisses;
       final Map<IPatternDetails, CraftingBytecode> compiled = new ConcurrentHashMap<>();
       final Map<AEKey, java.util.Set<AEKey>> fuzzy = new ConcurrentHashMap<>();
       final java.util.Set<AEKey> processing = ConcurrentHashMap.newKeySet();
@@ -47,9 +50,27 @@ public class PatternCompiler {
    }
    private static final ThreadLocal<State> STATE = ThreadLocal.withInitial(State::new);
    public static Scope openScope() {
+      return openScope(false);
+   }
+   public static Scope openScope(boolean detailed) {
       State previous = STATE.get();
-      STATE.set(new State());
+      State next = new State();
+      next.detailed = detailed;
+      STATE.set(next);
       return () -> STATE.set(previous);
+   }
+   public static Statistics statistics() {
+      State state = STATE.get();
+      return state.detailed ? new Statistics(state.compileHits, state.compileMisses, state.fuzzyHits, state.fuzzyMisses)
+            : new Statistics(-1, -1, -1, -1);
+   }
+   private static CraftingBytecode lookup(IPatternDetails pattern) {
+      State state = STATE.get();
+      var result = state.compiled.get(pattern);
+      if (state.detailed) {
+         if (result == null) state.compileMisses++; else state.compileHits++;
+      }
+      return result;
    }
 
    /**
@@ -167,7 +188,11 @@ public class PatternCompiler {
 
    /** The full set of acceptable variants for {@code key} (always contains {@code key} itself). */
    public static java.util.Set<AEKey> getFuzzyGroup(AEKey key) {
-      java.util.Set<AEKey> group = STATE.get().fuzzy.get(key);
+      State state = STATE.get();
+      java.util.Set<AEKey> group = state.fuzzy.get(key);
+      if (state.detailed) {
+         if (group == null) state.fuzzyMisses++; else state.fuzzyHits++;
+      }
       return group != null ? group : java.util.Set.of(key);
    }
 
@@ -248,7 +273,7 @@ public class PatternCompiler {
    }
 
    public static CraftingBytecode getCompiled(IPatternDetails pattern) {
-      return STATE.get().compiled.get(unwrapScaled(pattern));
+      return lookup(unwrapScaled(pattern));
    }
 
    public static CraftingBytecode compileRequest(IPatternDetails pattern, long requestedAmount) {
@@ -268,7 +293,7 @@ public class PatternCompiler {
    public static CraftingBytecode compileRequest(IPatternDetails pattern, BigInteger requestedAmount) {
       if (requestedAmount.signum() <= 0) throw new IllegalArgumentException("positive crafting request required");
       IPatternDetails effective = unwrapScaled(pattern);
-      CraftingBytecode patternBytecode = STATE.get().compiled.get(effective);
+      CraftingBytecode patternBytecode = lookup(effective);
       if (patternBytecode == null) {
          compileIfAbsent(effective);
          patternBytecode = STATE.get().compiled.get(effective);

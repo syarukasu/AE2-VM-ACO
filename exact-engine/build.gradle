@@ -1,7 +1,4 @@
-plugins {
-    id 'java-library'
-    id 'maven-publish'
-}
+plugins { id 'java-library'; id 'maven-publish' }
 group = 'com.syaru.ae2vm'
 version = '0.1.6'
 java {
@@ -9,38 +6,7 @@ java {
     withSourcesJar()
 }
 repositories { mavenCentral() }
-
-// #218: the retired graph solver is a comparison fixture, never a runtime dependency.
-sourceSets {
-    main { java.exclude 'com/syaru/ae2vm/exact/graph/**' }
-    graphFixture {
-        java.srcDir 'src/main/java'
-        java.include 'com/syaru/ae2vm/exact/graph/**'
-        compileClasspath += sourceSets.main.output
-        runtimeClasspath += sourceSets.main.output
-    }
-}
-sourceSets.test.compileClasspath += sourceSets.graphFixture.output
-sourceSets.test.runtimeClasspath += sourceSets.graphFixture.output
-configurations.testImplementation.extendsFrom(configurations.graphFixtureImplementation)
-
-dependencies {
-    graphFixtureImplementation 'de.uni-freiburg.informatik.ultimate:smtinterpol:2.5-1388-ga5a4ab0c'
-    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
-}
-tasks.register('graphFixtureJar', Jar) {
-    from sourceSets.graphFixture.output
-    archiveClassifier = 'graph-fixtures'
-}
-
-tasks.withType(Test).configureEach { useJUnitPlatform() }
 tasks.withType(JavaCompile).configureEach { options.encoding = 'UTF-8' }
-tasks.register('graphBenchmark', JavaExec) {
-    dependsOn testClasses
-    classpath = sourceSets.test.runtimeClasspath
-    mainClass = 'com.syaru.ae2vm.exact.graph.GraphPlannerBenchmark'
-    args layout.buildDirectory.file('reports/graph-planner-benchmark.csv').get().asFile.absolutePath
-}
 tasks.withType(Jar).configureEach {
     preserveFileTimestamps = false
     reproducibleFileOrder = true
@@ -53,7 +19,4 @@ jar {
         'FMLModType': 'GAMELIBRARY',
         'Implementation-Version': project.version)
 }
-publishing {
-    publications { engine(MavenPublication) { from components.java } }
-    repositories { maven { name = 'localProbe'; url = layout.buildDirectory.dir('repo') } }
-}
+publishing { publications { engine(MavenPublication) { from components.java } } }

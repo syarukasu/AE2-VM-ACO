@@ -61,21 +61,57 @@ public final class NativeVm {
         var server = Objects.requireNonNull(level.getServer());
         if (requested.signum() <= 0) throw new IllegalArgumentException("positive VM order required");
         long order = ORDERS.incrementAndGet(), started = System.nanoTime();
+        boolean benchmarkCapture = NativeVmBenchmark.claimCapture();
+        var observation = NativeVmProfiler.start(order, () -> output.getId().toString(), requested);
+        var timing = observation.timing();
         DIAGNOSTICS.started();
         var job = new AtomicReference<java.util.concurrent.Callable<ICraftingPlan>>();
         class OrderTask extends FutureTask<ICraftingPlan> {
-            OrderTask() { super(() -> job.get().call()); }
-            @Override protected void done() { ACTIVE.remove(this); }
+            OrderTask() {
+                super(() -> {
+                    timing.workerStarted();
+                    try { return job.get().call(); }
+                    finally { timing.workerFinished(); }
+                });
+            }
+            @Override protected void done() {
+                ACTIVE.remove(this);
+                if (!observation.enabled()) return;
+                // #221: FutureTask is the single terminal owner, including pre-run cancellation.
+                NativeVmProfiler.observe(() -> {
+                    if (isCancelled()) {
+                        observation.finish("cancelled", timing.cancellationReason());
+                        return;
+                    }
+                    try {
+                        get();
+                        boolean missing = timing.materialMissing();
+                        observation.finish(missing ? "material_missing" : "plan_ready",
+                                missing ? "materials_unavailable" : "completed");
+                    } catch (java.util.concurrent.ExecutionException failure) {
+                        var cause = failure.getCause();
+                        String reason = NativeVmProfiler.failureReason(cause);
+                        if (reason.equals("exception")) {
+                            String observed = timing.failureReason(cause);
+                            reason = observed == null ? cause.getClass().getName() : observed;
+                        }
+                        observation.finish(NativeVmProfiler.failureOutcome(cause),
+                                reason);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                });
+            }
             void fail(Throwable failure) { setException(failure); }
         }
         var task = new OrderTask();
         ACTIVE.put(task, server);
         Runnable initialize = () -> {
             if (task.isCancelled()) return;
+            timing.initializationStarted();
             try {
                 if (server.isStopped()) throw new CancellationException("server stopped");
                 var hook = (NativeVmHook) grid.getCraftingService();
-                var timing = new NativeVmTiming();
                 var extension = accounting;
                 VmAccounting.Stock stock;
                 try (var span = timing.phase(NativeVmTiming.Phase.STOCK)) {
@@ -90,16 +126,26 @@ public final class NativeVm {
                     orderContext = extension == null ? null : extension.orderContext(grid,level);
                 }
                 if (task.isCancelled()) return;
+                if (benchmarkCapture) {
+                    NativeVmProfiler.observe(() -> {
+                        try (var span = timing.phase(NativeVmTiming.Phase.DIAGNOSTIC_CAPTURE)) {
+                            NativeVmBenchmark.attach(order,
+                                    context.benchmarkSnapshot(output, requested, strategy == CalculationStrategy.CRAFT_LESS));
+                        }
+                    });
+                }
                 java.util.function.Function<NativeVmAccess, ICraftingPlan> compute = owner ->
                         compute(order, started, grid, level, output, requested,
                                 strategy, extension, context, orderContext, timing, owner);
-                if (context.requiresLiveAccess()) {
+                boolean liveAccess = context.requiresLiveAccess();
+                if (liveAccess) {
                     var calculation = new NativeVmCalculation(level, grid, output, strategy, access, compute);
                     job.set(calculation::run);
                 } else {
                     // Frozen exact inputs need neither AE2's placeholder tree nor its live-read tick registration.
                     job.set(() -> { try { return compute.apply(access); } finally { access.finish(); } });
                 }
+                timing.workerSubmitted(liveAccess);
                 hook.vm$execute(task);
             } catch (Throwable failure) {
                 if (failure instanceof CancellationException) DIAGNOSTICS.cancelled();
@@ -109,8 +155,13 @@ public final class NativeVm {
             }
         };
         // Off-thread API callers queue creation once, never one task per ingredient.
-        if (server.isSameThread()) initialize.run();
-        else try { server.execute(initialize); }
+        if (server.isSameThread()) {
+            timing.initializationSubmitted();
+            initialize.run();
+        } else try {
+            timing.initializationSubmitted();
+            server.execute(initialize);
+        }
         catch (RuntimeException failure) { task.fail(failure); }
         return task;
     }
@@ -157,8 +208,10 @@ public final class NativeVm {
                 } else plan = ordinaryPlan(exact);
             }
             String profile = timing.summary();
+            boolean simulation = plan.simulation();
+            timing.planResult(simulation);
             DIAGNOSTICS.record(new CalculationSample(order, output.getId().toString(), request,
-                    elapsed(started), plan.simulation() ? "missing" : "ready", profile));
+                    elapsed(started), simulation ? "missing" : "ready", profile));
             DIAGNOSTICS.completed(order, output.getId(), request, elapsed(started), plan.simulation(), profile);
             if (DIAGNOSTICS.verbose()) LOG.debug("AE2-VM event=quantity_calculated route=vm-native order={} "
                     + "output={} requested={} {}", order, output.getId(), request, profile);
