@@ -1,35 +1,9 @@
-# ACO Exact VM 0.1.2
+# ACO Exact VM 0.1.6
 
-Detached LGPL-3.0 library derived from the pinned AE2-VM source listed in
-NOTICE.txt. Build this module directly, not the upstream mod root:
+Java 17 pure BigInteger bytecode library, derived from TaoLe-si/AE2-VM under LGPL-3.0. See NOTICE.txt and the repository LICENSE for provenance and attribution.
 
-```powershell
-.\gradlew.bat -p exact-engine test build --no-daemon
-```
+Build with `gradlew -p exact-engine jar sourcesJar`. This module has no Minecraft mod bootstrap or live world access. ACO embeds the game-library JAR together with the native-engine module compiled by ACO.
 
-Java 17. The module has no Minecraft mod bootstrap, interception, mutable world,
-AE2 KeyCounter or ICraftingPlan dependency. ACO embeds its game-library JAR.
+Recipe coefficients, requested amounts, inventory, execution counts, missing and used amounts remain exact BigInteger values. Limits fail explicitly; they do not saturate or truncate. Physical CPU execution remains owned by AE2 and external add-ons.
 
-Input/output recipe coefficients, requested amounts, inventories, demands,
-execution counts and missing/used results are BigInteger. Indices and opcodes
-remain int. The caller supplies a maximum accepted quantity; exceeding it fails
-explicitly instead of clamping. The long convenience constructors preserve source
-compatibility and widen exactly. Opcode checkpoints support caller cancellation.
-
-ExactBytecode supports fixed single-output acyclic graphs. ExactBranchBytecode
-and ExactBranchVM add experimental ordered candidate trials, co-products,
-remainders and proven read-interval repetitions with BigInteger coefficients.
-The sibling native-engine module connects the branch interpreter to AE2's
-calculation entry and owns pattern acquisition. The redundant ACO graph-to-VM
-adapter has been removed (Issue #208). Native integration tests are maintained
-in the ACO Forge build; standalone library tests are not gameplay evidence.
-
-ACO provides exact stock and materializes the completed result for its public
-BigInteger API. Physical preparation belongs to the consuming execution API.
-CPU and physical execution ownership must remain with AE2/add-ons.
-VM result arrays are per invocation; immutable bytecode is reusable across orders.
-Tests cover empty/partial/sufficient stock, long boundaries, independent wide
-coefficients, cancellation, invalid graphs and concurrent bytecode reuse.
-
-Artifacts include the LGPL license, upstream provenance and sources JAR. Publish
-the corresponding fork source together with any distributed ACO release.
+Development tests and runtime evidence are maintained in the local development checkout. This public branch contains production source and build configuration only; it makes no gameplay or TPS acceptance claim.

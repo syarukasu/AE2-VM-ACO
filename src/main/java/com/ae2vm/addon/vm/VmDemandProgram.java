@@ -28,16 +28,27 @@ final class VmDemandProgram {
     record Ratio(BigInteger numerator, BigInteger denominator) {
         Ratio {
             if (denominator.signum() <= 0) throw new IllegalArgumentException("nonpositive demand denominator");
-            var gcd = numerator.gcd(denominator);
-            numerator = numerator.divide(gcd); denominator = denominator.divide(gcd);
+            if (numerator.signum() == 0) denominator = ONE;
+            else if (!denominator.equals(ONE)) {
+                var gcd = numerator.gcd(denominator);
+                numerator = numerator.divide(gcd); denominator = denominator.divide(gcd);
+            }
         }
         static Ratio of(BigInteger value) { return new Ratio(value, ONE); }
         Ratio add(Ratio other) {
+            if (numerator.signum() == 0) return other;
+            if (other.numerator.signum() == 0) return this;
+            if (denominator.equals(other.denominator)) return new Ratio(numerator.add(other.numerator), denominator);
             return new Ratio(numerator.multiply(other.denominator).add(other.numerator.multiply(denominator)),
                     denominator.multiply(other.denominator));
         }
-        Ratio multiply(Ratio other) { return new Ratio(numerator.multiply(other.numerator), denominator.multiply(other.denominator)); }
+        Ratio multiply(Ratio other) {
+            if (ONE.equals(numerator) && ONE.equals(denominator)) return other;
+            if (ONE.equals(other.numerator) && ONE.equals(other.denominator)) return this;
+            return new Ratio(numerator.multiply(other.numerator), denominator.multiply(other.denominator));
+        }
         BigInteger scale(BigInteger times) {
+            if (denominator.equals(ONE)) return numerator.multiply(times);
             var parts = numerator.multiply(times).divideAndRemainder(denominator);
             if (parts[1].signum() != 0) throw new IllegalStateException("non-integral aggregated demand");
             return parts[0];

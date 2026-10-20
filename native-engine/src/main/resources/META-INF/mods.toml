@@ -3,7 +3,7 @@ loaderVersion="[47,)"
 license="LGPL-3.0"
 [[mods]]
 modId="ae2vm_aco"
-version="0.3.12-vm-refs.8"
+version="0.3.13-profiler.1"
 displayName="AE2 VM ACO Exact Fork"
 authors="AE2-VM contributors, syarukasu"
 description='''BigInteger VM planning with order-local batched references. Local development candidate.'''
