@@ -36,6 +36,11 @@ final class NativeVmAccess implements NativeVmTiming.AccessObservation {
         return granted && clock.getAsLong() - deadline >= 0;
     }
 
+    void releaseForArithmetic() {
+        if (depth != 0) throw new IllegalStateException("Cannot release an active world callback");
+        synchronized (monitor) { release(); }
+    }
+
     <T> T read(Supplier<T> callback) {
         return read(ReadKind.OTHER, callback);
     }

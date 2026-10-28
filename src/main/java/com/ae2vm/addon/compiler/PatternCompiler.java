@@ -7,6 +7,7 @@ import appeng.api.stacks.GenericStack;
 import java.math.BigInteger;
 import com.ae2vm.addon.vm.CraftingBytecode;
 import com.ae2vm.addon.vm.Opcode;
+import com.ae2vm.addon.vm.VmPatternOutputs;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,6 +20,8 @@ public class PatternCompiler {
    }
    /** Input semantics supplied by the host. Live callbacks require AE2's exclusive calculation slice. */
    public interface DetachedInput extends IInput {
+      /** All intermediate returns are valid, same-type/primary-key tools; the final use consumes it. */
+      default FiniteUse finiteUse(AEKey key) { return null; }
       default BigInteger exactMultiplier() { return BigInteger.valueOf(getMultiplier()); }
       AEKey craftedKey();
       boolean emittable();
@@ -30,6 +33,8 @@ public class PatternCompiler {
       default boolean isCandidatePrepared(AEKey key) { return false; }
       /** False only when the captured candidate domain has no possible returns. */
       default boolean mayReturnItems() { return exactKey() == null; }
+      /** #236: representatives of ALL possible return families, including future variants. Null means unknown. */
+      default AEKey[] returnFamilyUpperBound() { return null; }
       /** Whether an output can feed this input on the next execution of the pattern. */
       default boolean mayConsumeOutput(AEKey key) {
          if (exactKey() != null) return exactKey().equals(key);
@@ -37,11 +42,21 @@ public class PatternCompiler {
             if (template.what().getPrimaryKey().equals(key.getPrimaryKey())) return true;
          return false;
       }
+
+   }
+   public interface FiniteUse {
+      BigInteger uses();
+      /** Exact return after 1..uses applications; null only at uses(). No live callbacks. */
+      AEKey after(BigInteger applications);
    }
    public interface Scope extends AutoCloseable { @Override void close(); }
    public record Statistics(long compileHits, long compileMisses, long fuzzyHits, long fuzzyMisses) { }
+   private record Division(BigInteger amount, BigInteger output) { }
    private static final class State {
       boolean detailed;
+      boolean scoped;
+      long divisionBits;
+      final Map<Division, BigInteger> divisions = new java.util.LinkedHashMap<>(128, 0.75f, true);
       long compileHits, compileMisses, fuzzyHits, fuzzyMisses;
       final Map<IPatternDetails, CraftingBytecode> compiled = new ConcurrentHashMap<>();
       final Map<AEKey, java.util.Set<AEKey>> fuzzy = new ConcurrentHashMap<>();
@@ -56,6 +71,7 @@ public class PatternCompiler {
       State previous = STATE.get();
       State next = new State();
       next.detailed = detailed;
+      next.scoped = true;
       STATE.set(next);
       return () -> STATE.set(previous);
    }
@@ -323,9 +339,8 @@ public class PatternCompiler {
    private static CraftingBytecode compileOrderedPattern(IPatternDetails pattern) {
       // #208: a slot's units/returns cannot be reconstructed from a global fuzzy-key union.
       var builder = new CraftingBytecode.Builder();
-      var primary = pattern.getPrimaryOutput();
-      if (primary.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
-      builder.setOutput(builder.addConstant(primary.what()), outputAmount(pattern, primary));
+      var outputs = VmPatternOutputs.inspect(pattern);
+      builder.setOutput(builder.addConstant(outputs.primary()), outputs.amount(outputs.primary()));
       int patternIndex = builder.addPattern(pattern);
       var inputs = pattern.getInputs();
       for (int slot = 0; slot < inputs.length; slot++) {
@@ -336,18 +351,21 @@ public class PatternCompiler {
          BigInteger amount = BigInteger.valueOf(alternatives[0].amount())
                .multiply(inputMultiplier(inputs[slot]));
          builder.emit(Opcode.DUP);
-         builder.emitPushAmount(amount);
-         builder.emit(Opcode.MUL);
+         if (!amount.equals(BigInteger.ONE)) {
+            builder.emitPushAmount(amount);
+            builder.emit(Opcode.MUL);
+         }
          builder.emit(Opcode.REQUEST_INPUT);
          builder.emitShort(slot);
       }
       builder.emit(Opcode.RETURN_CONTAINERS);
-      for (var output : pattern.getOutputs()) {
-         if (output.amount() <= 0) throw new IllegalArgumentException("positive pattern output required");
-         int index = builder.addConstant(output.what());
+      for (var output : outputs.amounts().entrySet()) {
+         int index = builder.addConstant(output.getKey());
          builder.emit(Opcode.DUP);
-         builder.emitPushAmount(outputAmount(pattern, output));
-         builder.emit(Opcode.MUL);
+         if (!output.getValue().equals(BigInteger.ONE)) {
+            builder.emitPushAmount(output.getValue());
+            builder.emit(Opcode.MUL);
+         }
          builder.emitInsertOutput(index);
       }
       builder.emitRecordPattern(patternIndex);
@@ -413,8 +431,37 @@ public class PatternCompiler {
    public static BigInteger ceilDiv(BigInteger amount, BigInteger output) {
       if (amount.signum() < 0 || output.signum() <= 0)
          throw new IllegalArgumentException("invalid exact division");
+      // #232: Applied Enhancements-inspired identity paths; no narrowing or saturation.
+      if (amount.signum() == 0 || output.equals(BigInteger.ONE)) return amount;
+      if (amount.compareTo(output) <= 0) return BigInteger.ONE;
+      int shift = output.getLowestSetBit();
+      if (output.bitLength() == shift + 1) {
+         var quotient = amount.shiftRight(shift);
+         return amount.getLowestSetBit() < shift ? quotient.add(BigInteger.ONE) : quotient;
+      }
+      // #236: repeated wide quotients are pure arithmetic, scoped to this order only.
+      var state = STATE.get();
+      boolean retain = state.scoped && amount.bitLength() > 128
+            && (long) amount.bitLength() + output.bitLength() <= 262144;
+      var key = retain ? new Division(amount, output) : null;
+      if (retain) {
+         var known = state.divisions.get(key);
+         if (known != null) return known;
+      }
       var divided = amount.divideAndRemainder(output);
-      return divided[1].signum() == 0 ? divided[0] : divided[0].add(BigInteger.ONE);
+      var result = divided[1].signum() == 0 ? divided[0] : divided[0].add(BigInteger.ONE);
+      if (retain) {
+         long bits = (long) amount.bitLength() + output.bitLength() + result.bitLength();
+         while (!state.divisions.isEmpty() && (state.divisions.size() >= 1024
+               || state.divisionBits + bits > 8388608)) {
+            var entries = state.divisions.entrySet().iterator();
+            var old = entries.next(); entries.remove();
+            state.divisionBits -= (long) old.getKey().amount.bitLength()
+                  + old.getKey().output.bitLength() + old.getValue().bitLength();
+         }
+         state.divisions.put(key, result); state.divisionBits += bits;
+      }
+      return result;
    }
 
    public static BigInteger inputMultiplier(IInput input) {

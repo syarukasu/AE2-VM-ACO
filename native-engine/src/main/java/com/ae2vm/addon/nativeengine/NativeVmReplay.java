@@ -98,6 +98,7 @@ final class NativeVmReplay {
                 return choices.isEmpty() ? null : choices.get(0);
             });
             vm.setAllPatternsResolver(key -> List.copyOf(snapshot.producers.getOrDefault(key, List.of())));
+            vm.setOrderAllocation(true);
             vm.setEmitterResolver(snapshot.emitters::contains);
             vm.setCheckpoint(NativeVmReplay::checkpoint);
             var plan = vm.execute(PatternCompiler.compileRequest(snapshot.root, snapshot.requested),

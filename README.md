@@ -1,15 +1,22 @@
-# AE2-VM-ACO
+# AE2-VM-ACO: ACO 2.0.0 Sources
 
-ACO-specific LGPL-3.0 derivative of [TaoLe-si/AE2-VM](https://github.com/TaoLe-si/AE2-VM), based on upstream commit `f9e083732ee654a99a1679bcdee7f864eb90be94`. Original authors retain their copyrights and credits; see LICENSE and exact-engine/NOTICE.txt.
+Source fork used by [AE2 Crafting Optimizer](https://github.com/syarukasu/ae2-crafting-optimizer).
+Do not install it separately: the required runtime modules are bundled in ACO.
 
-This branch contains only the VM source used by the Forge ACO beta. It is not a standalone replacement for upstream AE2-VM. Do not install another copy of the bundled VM modules beside ACO.
+This branch contains the shared BigInteger arithmetic core, Forge native adapter
+and exact-count library. It adds prepared whole-order allocation, shared-material
+supply proofs, bounded order-local caches, finite-tool returns and diagnostics.
+Unknown callbacks retain the guarded path. No item-specific planning exception.
 
-- `exact-engine`: pure BigInteger bytecode library, without a Minecraft mod bootstrap.
-- `native-engine`: native AE2 integration, compiled and reobfuscated by ACO's build.
-- `src/main/java`: shared compiler and VM arithmetic used by native-engine.
+Actual Forge GUI shortage planning for the circuit completed in 5.634 seconds
+at `2^63-1` and 7.319 seconds at `10^1024-1`. These are not manufacturing,
+fully-funded huge-order, NeoForge runtime or universal latency guarantees.
 
-Java 17 is required. Build the pure library with `gradlew -p exact-engine jar sourcesJar`. To build the installable mod, use the matching ACO source branch and pass `-PacoExactVmDir=/path/to/this/checkout/exact-engine`.
+Build the exact library with Java 17 from `exact-engine` using
+`../gradlew jar sourcesJar`. ACO compiles the native adapter for its platform.
+NeoForge retains the clean refs.8 host at commit
+`5b57a00e283d355a47ee5276ba528b2dcf7d07db` and adapts this shared core.
 
-AE2 owns its calculation worker pool. Request initialization captures stock, candidate order and auditable input rules on the server thread. Frozen arithmetic runs on AE2 workers; unsupported live predicates use AE2-managed exclusive read intervals. Physical execution, power, reservation and refunds remain owned by AE2 or the external CPU.
-
-This beta includes optional bounded profiling, explicitly armed detached replay, and exact rational arithmetic fast paths. Future-version dependency admission is not a binary-compatibility guarantee. Live wide crafting, refund/restart recovery and industrial TPS acceptance are not established by this source release.
+Tests, local reports, worlds, dependency JARs and generated outputs are excluded.
+Derived from [TaoLe-si/AE2-VM](https://github.com/TaoLe-si/AE2-VM); the original
+license and third-party attribution are retained in LICENSE and module notices.
