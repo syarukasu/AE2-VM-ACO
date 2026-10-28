@@ -26,6 +26,11 @@ import net.minecraft.world.level.Level;
 
 /** Per-order coefficients, stock and candidate observations captured before VM arithmetic. */
 final class NativeVmPlanningContext {
+    private static final int RETURN_LOOKAHEAD_KEYS = 16;
+    private static final int RETURN_LOOKAHEAD_PROBES = 64;
+    private static final int REUSE_ENTRIES = 16, REUSE_OBSERVATIONS = 8192;
+    private static final long REUSE_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+    private static final java.util.ArrayDeque<ReusablePlan> REUSABLE = new java.util.ArrayDeque<>();
     private final IGrid grid;
     private final Level level;
     private final ICraftingSimulationRequester requester;
@@ -39,6 +44,7 @@ final class NativeVmPlanningContext {
     private final Map<AEKey, List<IPatternDetails>> producerChoices = new HashMap<>();
     private final Map<AEKey, List<IPatternDetails>> programsByKey = new HashMap<>();
     private final Map<IPatternDetails, RuntimeException> preparationFailures = new IdentityHashMap<>();
+    private final Map<AEItemKey, NativeToolRule> toolRules = new HashMap<>();
     private final Map<Object, java.util.Set<AEKey>> candidateFamilies = new HashMap<>();
     private final Map<Object, List<LiveInput>> inputsByFamily = new HashMap<>();
     private final Map<ICraftingService, Map<AEKey, Boolean>> emitterAnswers = new IdentityHashMap<>();
@@ -47,7 +53,12 @@ final class NativeVmPlanningContext {
     private boolean emitterServiceResolved;
     private ICraftingService emitterService;
     private boolean catalogPrepared;
+    private boolean orderAllocation = true;
+
+    void setOrderAllocation(boolean enabled) { orderAllocation = enabled; }
     private boolean candidateDomainClosed;
+    private com.ae2vm.addon.vm.VmStockGuard stockGuard;
+    private boolean recordingReads;
     private final java.util.Set<Object> openCandidateFamilies = new java.util.HashSet<>();
 
     NativeVmPlanningContext(IGrid grid, Level level, ICraftingSimulationRequester requester,
@@ -148,6 +159,73 @@ final class NativeVmPlanningContext {
     }
 
     VmQuantities plan(AEKey root, BigInteger requested, boolean craftLess, LongConsumer progress) {
+        var stamp = reuseStamp(root);
+        var previous = reusable(root, requested, craftLess, stamp);
+        ReusablePlan validated = null;
+        if (previous != null) {
+            timing.stockGuardAvailable(previous.guard() != null);
+            boolean valid;
+            try (var span = timing.phase(NativeVmTiming.Phase.VALIDATE)) {
+                valid = validateObservations(previous.observations());
+            }
+            if (valid) timing.planReplayPrepared();
+            if (valid) validated = previous;
+            boolean sameStock = previous.stamp().stock().equals(stamp.stock());
+            var rejection = valid && previous.guard() != null
+                    ? previous.guard().rejection(stock.amounts()) : null;
+            if (rejection != null) timing.stockGuardRejected(rejection);
+            if (valid && (previous.guard() != null ? rejection == null : sameStock)) {
+                checkpoint.run();
+                timing.planReused();
+                if (!previous.stamp().stock().equals(stamp.stock())) timing.stockGuardReused();
+                if (Boolean.getBoolean("ae2vm.replay.verify")) {
+                    var checked = executePlan(root, requested, craftLess, progress);
+                    if (!sameAccounting(previous.result(), checked))
+                        throw new IllegalStateException("Validated VM replay accounting mismatch");
+                    timing.planReuseVerified();
+                } else {
+                    timing.execution(0, 0, 0, 0);
+                    timing.vmWork(0, 0);
+                }
+                return previous.result();
+            }
+        }
+        validatedRoutes = validated == null ? null : validated.routes();
+        inheritedObservations = validated == null ? List.of() : validated.observations();
+        recordRoutes = stamp != null && !Boolean.getBoolean("ae2vm.replay.disabled");
+        var result = executePlan(root, requested, craftLess, progress);
+        if (validatedRoutes != null && Boolean.getBoolean("ae2vm.replay.verify")) {
+            var retained = routes;
+            var guard = stockGuard;
+            validatedRoutes = null;
+            recordRoutes = false;
+            var checked = executePlan(root, requested, craftLess, progress);
+            if (!sameAccounting(result, checked))
+                throw new IllegalStateException("Validated VM route accounting mismatch");
+            timing.routeReuseVerified();
+            routes = retained;
+            stockGuard = guard;
+        }
+        remember(root, requested, craftLess, stamp, result);
+        return result;
+    }
+
+    private com.ae2vm.addon.vm.VmRouteCache validatedRoutes, routes;
+    private List<Observation> inheritedObservations = List.of();
+    private boolean recordRoutes;
+
+    private VmQuantities executePlan(AEKey root, BigInteger requested, boolean craftLess, LongConsumer progress) {
+        for (var pattern : programs.values()) if (pattern.inputs != null) for (var slot : pattern.inputs) {
+            var input = (LiveInput) slot;
+            input.validReads.clear(); input.remainderReads.clear();
+        }
+        // #236: reused branches still depend on their freshly validated opaque answers.
+        for (var observation : inheritedObservations) {
+            var input = (LiveInput) programs.get(bindings.get(observation.pattern())).inputs[observation.slot()];
+            if (observation.answer().valid() != null) input.validReads.add(observation.key());
+            if (observation.answer().remainderKnown()) input.remainderReads.add(observation.key());
+        }
+        recordingReads = true;
         try (var scope = PatternCompiler.openScope(timing.detailed())) {
             try {
                 var vm = new CraftingVM(this, key -> {
@@ -155,16 +233,29 @@ final class NativeVmPlanningContext {
                     return choices.isEmpty() ? null : choices.get(0);
                 });
                 vm.setAllPatternsResolver(this::candidates);
+                // #236: order allocation inspects only a prepared, error-free catalog, never unused live callbacks.
+                vm.setOrderAllocation(orderAllocation && catalogPrepared && preparationFailures.isEmpty());
                 vm.setEmitterResolver(key -> canEmit(emitterService(), key));
-                vm.setProgressListener(progress);
+                vm.setProgressListener(work -> {
+                    timing.planningPath(vm.planningStatus());
+                    timing.executionProgress(vm.stateCopies(), vm.branchTrials(), vm.branchEntries(), vm.aggregatedBlocks());
+                    timing.vmWork(vm.instructions(), work);
+                    progress.accept(work);
+                });
                 vm.setCheckpoint(checkpoint);
+                if (recordRoutes) vm.setValidatedRoutes(validatedRoutes, ids);
                 com.ae2vm.addon.vm.VmCraftingPlan result;
                 try (var span = timing.phase(NativeVmTiming.Phase.VM)) {
                     try {
                         result = vm.execute(PatternCompiler.compileRequest(root, requested),
                                 new VmSimulationState(stock.amounts(), stock.complete()), craftLess);
+                        stockGuard = vm.stockGuard();
+                        routes = vm.routes();
+                        timing.stockGuardAvailable(stockGuard != null);
                     } finally {
+                        timing.planningPath(vm.planningStatus());
                         timing.execution(vm.stateCopies(), vm.branchTrials(), vm.branchEntries(), vm.aggregatedBlocks());
+                        timing.routes(vm.reusedRoutes(), vm.routes() == null ? 0 : vm.routes().size());
                         timing.vmWork(vm.instructions(), vm.work());
                     }
                 }
@@ -176,12 +267,209 @@ final class NativeVmPlanningContext {
                         result.missingItems().quantities(), result.bytes(), Map.of(), result.multiplePaths(),
                         vm.instructions(), vm.work(), vm.skippedIterations());
             } finally {
+                recordingReads = false;
                 NativeVmProfiler.observe(() -> {
                     var stats = PatternCompiler.statistics();
                     timing.compiler(stats.compileHits(), stats.compileMisses(), stats.fuzzyHits(), stats.fuzzyMisses());
                 });
             }
         }
+    }
+
+    // #236: only pure arithmetic is retained. Every order recaptures world-owned inputs.
+    private record InputStamp(List<GenericStack> templates, long multiplier, BigInteger scale,
+            AEKey crafted, boolean emitted, AEKey exact, boolean nativeExact,
+            Map<AEKey, ObservedAnswer> initialAnswers, java.util.Set<AEKey> returnFamilies) { }
+    private record PatternStamp(AEItemKey definition, List<GenericStack> outputs,
+            BigInteger scale, List<InputStamp> inputs) { }
+    private record StockEntry(AEKey key, BigInteger amount) { }
+    private record ReuseStamp(List<PatternStamp> patterns, Map<AEKey, List<String>> choices,
+            Map<AEKey, Boolean> emitters, List<StockEntry> stock, boolean closed, boolean orderAllocation) { }
+    private record ObservedAnswer(Boolean valid, AEKey remainder, boolean remainderKnown) { }
+    private record Observation(String pattern, int slot, AEKey key, ObservedAnswer answer) { }
+    private record ReusablePlan(Object grid, Object level, Object producer, AEKey root, BigInteger requested,
+            boolean craftLess, long created, ReuseStamp stamp, Map<String, IPatternDetails> sources,
+            List<Observation> observations, VmQuantities result, com.ae2vm.addon.vm.VmStockGuard guard,
+            com.ae2vm.addon.vm.VmRouteCache routes) { }
+
+    static void clearReusablePlans() { synchronized (REUSABLE) { REUSABLE.clear(); } }
+
+    private ReuseStamp reuseStamp(AEKey root) {
+        if (!catalogPrepared || !stock.complete() || !preparationFailures.isEmpty()) {
+            timing.planReplayIneligible();
+            return null;
+        }
+        var patterns = new ArrayList<PatternStamp>();
+        for (var source : bindings.values()) {
+            var pattern = programs.get(source);
+            var inputs = new ArrayList<InputStamp>();
+            for (var slot : pattern.inputs) {
+                var input = (LiveInput) slot;
+                if (!input.failures.isEmpty()) { timing.planReplayIneligible(); return null; }
+                var bound = input.returnFamilyUpperBound();
+                inputs.add(new InputStamp(List.of(input.templates), input.multiplier, input.scale,
+                        input.crafted, input.emitted, input.exact, input.metadata.nativeExact(), answers(input),
+                        bound == null ? null : java.util.Set.copyOf(List.of(bound))));
+            }
+            patterns.add(new PatternStamp(pattern.skeleton.definition(), List.of(pattern.skeleton.outputs()),
+                    pattern.skeleton.scale(), List.copyOf(inputs)));
+        }
+        var choices = new HashMap<AEKey, List<String>>();
+        programsByKey.forEach((key, values) -> choices.put(key, values.stream().map(ids::get).toList()));
+        var inventory = new ArrayList<StockEntry>();
+        // Uncertified plans require the complete normalized stock, including collision ordering.
+        Map.copyOf(stock.amounts()).forEach((key, amount) -> inventory.add(new StockEntry(key, amount)));
+        return new ReuseStamp(List.copyOf(patterns), Map.copyOf(choices),
+                Map.copyOf(emitterAnswers.getOrDefault(emitterService, Map.of())),
+                List.copyOf(inventory), candidateDomainClosed, orderAllocation);
+    }
+
+    private static Map<AEKey, ObservedAnswer> answers(LiveInput input) {
+        var result = new HashMap<AEKey, ObservedAnswer>();
+        input.valid.forEach((key, value) -> result.put(key, answer(input, key)));
+        input.remainders.forEach((key, value) -> result.put(key, answer(input, key)));
+        return Map.copyOf(result);
+    }
+
+    private static ObservedAnswer answer(LiveInput input, AEKey key) {
+        return new ObservedAnswer(input.valid.get(key), input.remainders.get(key), input.remainders.containsKey(key));
+    }
+
+    private ReusablePlan reusable(AEKey root, BigInteger requested, boolean craftLess, ReuseStamp stamp) {
+        if (stamp == null || Boolean.getBoolean("ae2vm.replay.disabled")) return null;
+        List<ReusablePlan> candidates;
+        synchronized (REUSABLE) {
+            long now = System.nanoTime();
+            REUSABLE.removeIf(entry -> now - entry.created() >= REUSE_NANOS);
+            candidates = List.copyOf(REUSABLE);
+        }
+        ReusablePlan warmup = null;
+        for (int i = candidates.size() - 1; i >= 0; i--) {
+            checkpoint.run();
+            var entry = candidates.get(i);
+            if (entry.grid() != grid || entry.level() != level || entry.producer() != producerService
+                    || !entry.root().equals(root) || !entry.requested().equals(requested)
+                    || entry.craftLess() != craftLess) continue;
+            var old = entry.stamp();
+            if (!old.patterns().equals(stamp.patterns()) || !old.choices().equals(stamp.choices())
+                    || !old.emitters().equals(stamp.emitters()) || old.closed() != stamp.closed()
+                    || old.orderAllocation() != stamp.orderAllocation()) {
+                timing.planReplayMetadataChanged();
+                continue;
+            }
+            boolean same = entry.sources().size() == bindings.size();
+            for (var binding : bindings.entrySet()) same &= entry.sources().get(binding.getKey()) == binding.getValue();
+            if (same) {
+                if (warmup == null) warmup = entry;
+                boolean sameStock = old.stock().equals(stamp.stock());
+                if (entry.guard() != null ? entry.guard().accepts(stock.amounts()) : sameStock) {
+                    if (!sameStock) timing.planReplayStockChanged();
+                    return entry;
+                }
+                continue;
+            }
+            timing.planReplayMetadataChanged();
+        }
+        // A rejected certificate can still supply a freshly validated observation schedule.
+        if (warmup != null && !warmup.stamp().stock().equals(stamp.stock())) timing.planReplayStockChanged();
+        return warmup;
+    }
+
+    private boolean validateObservations(List<Observation> observations) {
+        access.releaseForArithmetic();
+        try {
+            var pending = new ArrayList<Observation>();
+            // #236: pure rules must not spend the live callback window's deadline.
+            for (var observation : observations) {
+                checkpoint.run();
+                int local = validateObservation(observation, false);
+                if (local < 0) return false;
+                if (local == 0) pending.add(observation);
+            }
+            int cursor = 0;
+            while (cursor < pending.size()) {
+                int start = cursor;
+                cursor = access.read(ReadKind.INPUT_VALIDITY, () -> {
+                    int next = start;
+                    do {
+                        checkpoint.run();
+                        if (validateObservation(pending.get(next), true) < 0) return -1;
+                        next++;
+                    } while (next < pending.size() && next - start < 256 && !access.readWindowExpired());
+                    return next;
+                });
+                if (cursor < 0) return false;
+            }
+            return true;
+        } finally {
+            access.releaseForArithmetic();
+        }
+    }
+
+    private int validateObservation(Observation observation, boolean liveAllowed) {
+        var input = (LiveInput) programs.get(bindings.get(observation.pattern())).inputs[observation.slot()];
+        var key = observation.key();
+        var expected = observation.answer();
+        if (expected.valid() != null && !input.valid.containsKey(key) && !input.failures.containsKey(key)) {
+            if (input.exact != null) input.valid.put(key, input.exact.equals(key));
+            else if (input.rejectsUnmatchedKeyLocally(key)) input.valid.put(key, false);
+            else if (!input.observeRule(key)) {
+                if (!liveAllowed) return 0;
+                input.observeLive(key);
+            }
+        }
+        if (expected.remainderKnown() && !input.remainders.containsKey(key) && !input.failures.containsKey(key)) {
+            if (!input.observeRule(key)) {
+                if (!liveAllowed) return 0;
+                try { input.getRemainingKey(key); }
+                catch (java.util.concurrent.CancellationException cancelled) { throw cancelled; }
+                catch (RuntimeException failure) { input.failures.put(key, failure); }
+            }
+        }
+        var actual = answer(input, key);
+        return input.failures.containsKey(key)
+                || expected.valid() != null && !expected.valid().equals(actual.valid())
+                || expected.remainderKnown() && (!actual.remainderKnown()
+                        || !Objects.equals(expected.remainder(), actual.remainder())) ? -1 : 1;
+    }
+
+    private void remember(AEKey root, BigInteger requested, boolean craftLess, ReuseStamp stamp, VmQuantities result) {
+        if (stamp == null || Boolean.getBoolean("ae2vm.replay.disabled")) return;
+        var observations = new ArrayList<Observation>();
+        for (var binding : bindings.entrySet()) {
+            var inputs = programs.get(binding.getValue()).inputs;
+            for (int i = 0; i < inputs.length; i++) {
+                var input = (LiveInput) inputs[i];
+                if (!input.failures.isEmpty()) return;
+                var readKeys = new java.util.LinkedHashSet<>(input.validReads);
+                readKeys.addAll(input.remainderReads);
+                for (var key : readKeys) {
+                    if (observations.size() == REUSE_OBSERVATIONS) { timing.planReplayIneligible(); return; }
+                    observations.add(new Observation(binding.getKey(), i, key,
+                            new ObservedAnswer(input.validReads.contains(key) ? input.valid.get(key) : null,
+                                    input.remainderReads.contains(key) ? input.remainders.get(key) : null,
+                                    input.remainderReads.contains(key))));
+                }
+            }
+        }
+        var entry = new ReusablePlan(grid, level, producerService, root, requested, craftLess, System.nanoTime(),
+                stamp, Map.copyOf(bindings), List.copyOf(observations), result, stockGuard, routes);
+        timing.planReplayObservations(observations.size());
+        synchronized (REUSABLE) {
+            REUSABLE.removeIf(old -> old.grid() == grid && old.level() == level && old.root().equals(root)
+                    && old.requested().equals(requested) && old.craftLess() == craftLess
+                    && old.stamp().stock().equals(stamp.stock()));
+            if (REUSABLE.size() == REUSE_ENTRIES) REUSABLE.removeFirst();
+            REUSABLE.addLast(entry);
+        }
+    }
+
+    private static boolean sameAccounting(VmQuantities first, VmQuantities second) {
+        return first.root().equals(second.root()) && first.requested().equals(second.requested())
+                && first.crafts().equals(second.crafts()) && first.used().equals(second.used())
+                && first.emitted().equals(second.emitted()) && first.missing().equals(second.missing())
+                && first.integerCharges().equals(second.integerCharges())
+                && first.stackCharges().equals(second.stackCharges()) && first.multiplePaths() == second.multiplePaths();
     }
 
     private ICraftingService producerService() {
@@ -307,6 +595,10 @@ final class NativeVmPlanningContext {
         private final Map<AEKey, Boolean> valid;
         private final Map<AEKey, AEKey> remainders;
         private final Map<AEKey, RuntimeException> failures = new HashMap<>();
+        private final java.util.Set<AEKey> validReads = new java.util.LinkedHashSet<>();
+        private final java.util.Set<AEKey> remainderReads = new java.util.LinkedHashSet<>();
+        private boolean returnBoundResolved;
+        private AEKey[] immutableReturnBound;
 
         LiveInput(IPatternDetails pattern, IPatternDetails.IInput source,
                 appeng.api.networking.crafting.ICraftingService service, InputMetadata metadata, BigInteger scale) {
@@ -368,7 +660,12 @@ final class NativeVmPlanningContext {
         public boolean mayReturnItems() {
             prepare();
             if (exact != null) return false;
-            if (!catalogPrepared || remainders.values().stream().anyMatch(Objects::nonNull)) return true;
+            if (!catalogPrepared) return true;
+            for (var entry : remainders.entrySet()) if (entry.getValue() != null) {
+                if (recordingReads) remainderReads.add(entry.getKey());
+                return true;
+            }
+            if (recordingReads) remainderReads.addAll(remainders.keySet());
             for (var template : templates)
                 if (openCandidateFamilies.contains(template.what().getPrimaryKey())) return true;
             return false;
@@ -379,9 +676,40 @@ final class NativeVmPlanningContext {
             if (rejectsUnmatchedKeyLocally(key)) return false;
             for (var template : templates) {
                 if (!template.what().getPrimaryKey().equals(key.getPrimaryKey())) continue;
+                if (recordingReads && valid.containsKey(key)) validReads.add(key);
                 return !valid.containsKey(key) || Boolean.TRUE.equals(valid.get(key));
             }
             return false;
+        }
+        public AEKey[] returnFamilyUpperBound() {
+            prepare();
+            if (exact != null) return new AEKey[0];
+            // #236: incomplete/live candidate domains cannot certify future returned families.
+            if (!catalogPrepared || !preparationFailures.isEmpty() || !failures.isEmpty()) return null;
+            if (!returnBoundResolved) {
+                immutableReturnBound = immutableReturnFamilyBound();
+                returnBoundResolved = true;
+            }
+            if (immutableReturnBound != null) return immutableReturnBound;
+            // #236: an opaque future state can change item family; observations alone cannot scope it.
+            if (!candidateDomainClosed) return null;
+            if (recordingReads) remainderReads.addAll(remainders.keySet());
+            return remainders.values().stream().filter(Objects::nonNull).toArray(AEKey[]::new);
+        }
+        private AEKey[] immutableReturnFamilyBound() {
+            if (metadata.rule() != null) {
+                var bound = new java.util.LinkedHashSet<AEKey>();
+                var keys = new java.util.LinkedHashSet<AEKey>(); keys.add(crafted);
+                for (var template : templates) keys.add(template.what());
+                boolean certified = true;
+                for (var key : keys) {
+                    var returned = metadata.rule().returnFamilyUpperBound(key);
+                    if (returned == null) { certified = false; break; }
+                    java.util.Collections.addAll(bound, returned);
+                }
+                if (certified) return bound.toArray(AEKey[]::new);
+            }
+            return null;
         }
         public boolean isCandidatePrepared(AEKey key) {
             prepare();
@@ -411,6 +739,7 @@ final class NativeVmPlanningContext {
         private boolean accepted(AEKey key) {
             var failure = failures.get(key);
             if (failure != null) throw failure;
+            if (recordingReads && valid.containsKey(key)) validReads.add(key);
             return Boolean.TRUE.equals(valid.get(key));
         }
 
@@ -430,14 +759,10 @@ final class NativeVmPlanningContext {
             }
             if (observeRule(key)) return;
             if (catalogPrepared) {
-                // #218: share one boundary for an encountered key, never enumerate its future returns.
+                // #235: bounded actual return observations, never a speculative inventory or unbounded closure.
                 access.read(ReadKind.INPUT_VALIDITY, () -> {
                     observeLive(key);
-                    for (var peer : inputsByFamily.getOrDefault(key.getPrimaryKey(), List.of())) {
-                        checkpoint.run();
-                        if (access.readWindowExpired()) break;
-                        if (!peer.isCandidatePrepared(key)) peer.observeLive(key);
-                    }
+                    observeReturnedBatch(key);
                     return null;
                 });
                 return;
@@ -445,11 +770,87 @@ final class NativeVmPlanningContext {
             observeLive(key);
         }
 
+        private void observeReturnedBatch(AEKey first) {
+            var pending = new java.util.ArrayDeque<AEKey>();
+            var visited = new java.util.HashSet<AEKey>();
+            pending.add(first);
+            visited.add(first);
+            int probes = 0;
+            // #236: advance the demanded input before unused peers can exhaust the shared budget.
+            var demanded = first;
+            while (true) {
+                checkpoint.run();
+                if (access.readWindowExpired() || probes++ >= RETURN_LOOKAHEAD_PROBES) return;
+                if (!isCandidatePrepared(demanded)) observeLive(demanded);
+                var returned = remainders.get(demanded);
+                if (failures.containsKey(demanded) || !Boolean.TRUE.equals(valid.get(demanded))
+                        || returned == null || !returned.getPrimaryKey().equals(first.getPrimaryKey())
+                        || visited.size() >= RETURN_LOOKAHEAD_KEYS || !visited.add(returned)) break;
+                pending.add(returned);
+                demanded = returned;
+            }
+            while (!pending.isEmpty()) {
+                var key = pending.remove();
+                for (var peer : inputsByFamily.getOrDefault(first.getPrimaryKey(), List.of())) {
+                    checkpoint.run();
+                    if (access.readWindowExpired() || probes++ >= RETURN_LOOKAHEAD_PROBES) return;
+                    if (!peer.isCandidatePrepared(key)) peer.observeLive(key);
+                    var returned = peer.remainders.get(key);
+                    if (!peer.failures.containsKey(key) && Boolean.TRUE.equals(peer.valid.get(key))
+                            && returned != null && returned.getPrimaryKey().equals(first.getPrimaryKey())
+                            && visited.size() < RETURN_LOOKAHEAD_KEYS && visited.add(returned)) {
+                        pending.add(returned);
+                    }
+                }
+            }
+        }
+
+        public PatternCompiler.FiniteUse finiteUse(AEKey key) {
+            prepare();
+            if (!nativeCrafting || metadata.rule() == null || !(key instanceof AEItemKey item)
+                    || metadata.rule().evaluate(key) != null) return null;
+            var rule = toolRules.get(NativeToolRule.base(item));
+            if (rule != null) return rule.finiteUse(item);
+            // The first real callback may normalize NBT before the certified wear law begins.
+            var first = getRemainingKey(key);
+            if (!(first instanceof AEItemKey next) || !key.getPrimaryKey().equals(next.getPrimaryKey())
+                    || metadata.rule().evaluate(next) != null) return null;
+            getRemainingKey(first);
+            rule = toolRules.get(NativeToolRule.base(next));
+            var tail = rule == null ? null : rule.finiteUse(next);
+            if (tail == null) return null;
+            return new PatternCompiler.FiniteUse() {
+                public BigInteger uses() { return tail.uses().add(BigInteger.ONE); }
+                public AEKey after(BigInteger count) {
+                    if (count.equals(BigInteger.ONE)) return first;
+                    return tail.after(count.subtract(BigInteger.ONE));
+                }
+            };
+        }
+
         private boolean observeRule(AEKey key) {
             var rule = metadata.rule();
             if (rule == null) return false;
             var decision = rule.evaluate(key);
+            if (decision == null && key instanceof AEItemKey item) {
+                var tool = toolRules.get(NativeToolRule.base(item));
+                var returned = tool == null ? null : tool.evaluate(item);
+                if (returned != null) {
+                    decision = new NativeCraftingRule.Decision(true, returned);
+                    timing.toolRuleAnswer();
+                }
+            }
             if (decision == null) return false;
+            if (Boolean.getBoolean("ae2vm.rules.verify")) {
+                var expected = decision;
+                access.read(ReadKind.INPUT_VALIDITY, () -> {
+                    boolean accepted = templates[0].what().equals(key) || source.isValid(key, level);
+                    AEKey returned = accepted ? source.getRemainingKey(key) : null;
+                    if (accepted != expected.accepted() || !Objects.equals(returned, expected.remainder()))
+                        throw new IllegalStateException("#236 crafting rule mismatch: " + key.getId());
+                    return null;
+                });
+            }
             valid.put(key, decision.accepted());
             remainders.put(key, decision.remainder());
             return true;
@@ -485,13 +886,23 @@ final class NativeVmPlanningContext {
             timing.cache(NativeVmTiming.Cache.REMAINDER, known);
             if (!known && !observeRule(key))
                 remainders.put(key, access.read(ReadKind.INPUT_REMAINDER, () -> readRemainder(key)));
+            if (recordingReads) remainderReads.add(key);
             return remainders.get(key);
         }
 
         private AEKey readRemainder(AEKey key) {
             var remainder = source.getRemainingKey(key);
+            if (nativeCrafting && metadata.rule() != null && toolRules.size() < 256
+                    && key instanceof AEItemKey item
+                    && NativeToolRule.auditedItem(item)
+                    && !toolRules.containsKey(NativeToolRule.base(item))) {
+                var rule = NativeToolRule.capture(key, remainder);
+                if (rule != null && toolRules.putIfAbsent(rule.base(), rule) == null) timing.toolRuleCaptured();
+            }
             timing.remainderRead(timing.detailed() ? source.getClass().getName() : "",
-                    timing.detailed() ? key.getId().toString() : "", remainder == null);
+                    timing.detailed() ? key.getId() + (remainder == null ? "" : "@"
+                            + NativeCraftingRule.recipeKind(pattern) + (metadata.rule() == null ? ":opaque" : ":snapshot")) : "",
+                    remainder == null);
             return remainder;
         }
     }

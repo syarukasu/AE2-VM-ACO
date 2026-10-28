@@ -16,6 +16,8 @@ final class VmDemandProgram {
     final Map<AEKey, Ratio> needs = new LinkedHashMap<>(), outputs = new LinkedHashMap<>();
     final Map<AEKey, Leaf> leaves = new LinkedHashMap<>();
     final Set<AEKey> intermediates = new LinkedHashSet<>(), dependencies = new HashSet<>();
+    final Set<AEKey> fuzzy = new HashSet<>();
+    final Set<AEKey> alternatives = new HashSet<>();
     final IPatternDetails pattern;
     int generation;
     final List<VmDemandProgram> children = new ArrayList<>();
@@ -48,10 +50,12 @@ final class VmDemandProgram {
             return new Ratio(numerator.multiply(other.numerator), denominator.multiply(other.denominator));
         }
         BigInteger scale(BigInteger times) {
-            if (denominator.equals(ONE)) return numerator.multiply(times);
-            var parts = numerator.multiply(times).divideAndRemainder(denominator);
+            if (denominator.equals(ONE)) return numerator.equals(ONE) ? times
+                    : times.equals(ONE) ? numerator : numerator.multiply(times);
+            // #236: a reduced fraction is integral iff its multiplicity is divisible.
+            var parts = times.divideAndRemainder(denominator);
             if (parts[1].signum() != 0) throw new IllegalStateException("non-integral aggregated demand");
-            return parts[0];
+            return numerator.equals(ONE) ? parts[0] : numerator.multiply(parts[0]);
         }
     }
 
@@ -63,12 +67,19 @@ final class VmDemandProgram {
         private final Map<IPatternDetails, Integer> unavailable = new IdentityHashMap<>();
         private final Set<IPatternDetails> visiting = Collections.newSetFromMap(new IdentityHashMap<>());
         private final Runnable control;
+        private boolean simulationSources;
+        private boolean equivalentSources;
+        Compiler equivalentSources() { equivalentSources = true; return this; }
         private Set<AEKey> stockBoundaries = Set.of();
         private final Map<IPatternDetails, Map<Set<AEKey>, StockedProgram>> stockedPrograms = new IdentityHashMap<>();
         private record StockedProgram(VmDemandProgram program, int generation) { }
         Compiler(Map<AEKey, List<IPatternDetails>> known) { this(known, null, () -> { }); }
         Compiler(Map<AEKey, List<IPatternDetails>> known, Runnable control) {
             this(known, null, control);
+        }
+        Compiler(Map<AEKey, List<IPatternDetails>> known, Runnable control, boolean simulationSources) {
+            this(known, null, control);
+            this.simulationSources = simulationSources;
         }
         Compiler(Map<AEKey, List<IPatternDetails>> known,
                 Function<AEKey, List<IPatternDetails>> resolver, Runnable control) {
@@ -90,6 +101,7 @@ final class VmDemandProgram {
                 return cached.program;
             // #218: stop at actual stock, not at a permanently uncraftable leaf.
             var compiler = new Compiler(known, null, control);
+            compiler.simulationSources = simulationSources;
             compiler.stockBoundaries = Set.copyOf(boundaries);
             var result = compiler.get(original.pattern);
             variants.put(compiler.stockBoundaries, new StockedProgram(result, known.size()));
@@ -99,6 +111,12 @@ final class VmDemandProgram {
         }
 
         VmDemandProgram getExpanded(IPatternDetails pattern, Predicate<AEKey> stocked) {
+            try { return expandChecked(pattern, stocked); }
+            catch (CancellationException cancelled) { throw cancelled; }
+            catch (RuntimeException unavailable) { return null; }
+        }
+
+        private VmDemandProgram expandChecked(IPatternDetails pattern, Predicate<AEKey> stocked) {
             if (resolver == null) return get(pattern);
             var path = Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>());
             var complete = Collections.newSetFromMap(new IdentityHashMap<IPatternDetails, Boolean>());
@@ -140,6 +158,16 @@ final class VmDemandProgram {
         }
 
         VmDemandProgram get(IPatternDetails pattern) {
+            // #236: compilation is speculative; ordered demand still exposes invalid metadata.
+            try { return getChecked(pattern); }
+            catch (CancellationException cancelled) { throw cancelled; }
+            catch (RuntimeException invalid) {
+                unavailable.put(pattern, known.size());
+                return null;
+            }
+        }
+
+        private VmDemandProgram getChecked(IPatternDetails pattern) {
             checkpoint();
             var cached = programs.get(pattern);
             if (cached != null) {
@@ -174,28 +202,38 @@ final class VmDemandProgram {
         }
 
         private VmDemandProgram compile(IPatternDetails pattern) {
+            if (simulationSources && pattern.getOutputs().length != 1) return null;
             var result = new VmDemandProgram(pattern, known.size());
             result.crafts.put(pattern, Ratio.of(ONE));
             result.bytes = new VmByteCost(ONE, ONE);
-            var primary = pattern.getPrimaryOutput().what();
-            for (var output : pattern.getOutputs()) {
-                merge(result.outputs, output.what(), Ratio.of(PatternCompiler.outputAmount(pattern, output)));
-                result.dependencies.add(output.what());
-                if (!output.what().equals(primary)) result.secondary.add(output.what());
+            var layout = VmPatternOutputs.inspect(pattern);
+            var primary = layout.primary();
+            for (var output : layout.amounts().entrySet()) {
+                merge(result.outputs, output.getKey(), Ratio.of(output.getValue()));
+                result.dependencies.add(output.getKey());
+                if (!output.getKey().equals(primary)) result.secondary.add(output.getKey());
             }
             for (var slot : pattern.getInputs()) {
                 checkpoint();
                 if (!(slot instanceof PatternCompiler.DetachedInput exact)) return null;
+                if (simulationSources && exact.mayReturnItems()) return null;
                 var templates = slot.getPossibleInputs();
-                if (templates.length != 1 || !exact.isCandidatePrepared(templates[0].what())) return null;
+                if (templates.length == 0 || !exact.isCandidatePrepared(templates[0].what())) return null;
+                for (var template : templates)
+                    if (!template.equals(templates[0])) return null;
                 var key = exact.exactKey();
-                if (key == null || !key.equals(templates[0].what()) || !key.equals(exact.craftedKey())) return null;
+                if (key == null) {
+                    key = exact.craftedKey();
+                    if (key == null || exact.mayReturnItems() || !exact.isValid(key, null)
+                            || exact.getRemainingKey(key) != null) return null;
+                    result.fuzzy.add(key);
+                }
+                if (!key.equals(templates[0].what()) || !key.equals(exact.craftedKey())) return null;
                 var unit = BigInteger.valueOf(templates[0].amount());
                 var amount = unit.multiply(PatternCompiler.inputMultiplier(slot));
                 result.nodes = result.nodes.add(ONE);
                 result.inputs.add(key); result.dependencies.add(key);
-                result.bytes = result.bytes.add(new VmByteCost(amount.multiply(BigInteger.valueOf(8)),
-                        BigInteger.valueOf(key.getType().getAmountPerByte())));
+                result.bytes = result.bytes.add(VmByteCost.forStack(amount, key.getType().getAmountPerByte()));
                 var choices = known.get(key);
                 if (exact.emittable() || stockBoundaries.contains(key) || choices == null || choices.isEmpty()) {
                     var leaf = new Leaf(unit, exact.emittable(), !exact.emittable()
@@ -206,7 +244,10 @@ final class VmDemandProgram {
                     result.children.add(null);
                     continue;
                 }
-                if (choices.size() != 1) return null;
+                if (choices.size() != 1) {
+                    if (!simulationSources && (!equivalentSources || !equivalentBatches(choices))) return null;
+                    result.alternatives.add(key);
+                }
                 var producer = choices.get(0);
                 if (!producer.getPrimaryOutput().what().equals(key)) return null;
                 var child = get(producer);
@@ -219,6 +260,8 @@ final class VmDemandProgram {
                 result.nodes = result.nodes.add(child.nodes);
                 result.intermediates.add(key); result.intermediates.addAll(child.intermediates);
                 result.dependencies.addAll(child.dependencies);
+                result.fuzzy.addAll(child.fuzzy);
+                result.alternatives.addAll(child.alternatives);
                 result.inputs.addAll(child.inputs); result.secondary.addAll(child.secondary);
                 for (var entry : child.leaves.entrySet()) {
                     var previous = result.leaves.putIfAbsent(entry.getKey(), entry.getValue());
@@ -236,9 +279,44 @@ final class VmDemandProgram {
             }
             if (!Collections.disjoint(result.inputs, result.secondary)
                     || result.inputs.contains(primary) || result.secondary.contains(primary)) return null;
+            for (var key : result.fuzzy) for (var dependency : result.dependencies)
+                if (!key.equals(dependency) && key.getType().equals(dependency.getType())
+                        && key.getPrimaryKey().equals(dependency.getPrimaryKey())) return null;
             result.outputs.entrySet().removeIf(entry -> entry.getValue().numerator().signum() == 0);
             if (result.outputs.values().stream().anyMatch(value -> value.numerator().signum() < 0)) return null;
             return result;
+        }
+
+        // #236: quota-only compilation, not an execution/capacity summary for alternate providers.
+        private boolean equivalentBatches(List<IPatternDetails> sources) {
+            var first = sources.get(0);
+            if (first.getOutputs().length != 1) return false;
+            var output = first.getPrimaryOutput();
+            var unit = PatternCompiler.outputAmount(first, output);
+            if (unit.signum() <= 0) return false;
+            for (var source : sources) {
+                checkpoint();
+                if (source.getOutputs().length != 1 || !source.getPrimaryOutput().what().equals(output.what())
+                        || source.getInputs().length != first.getInputs().length) return false;
+                var ratio = PatternCompiler.outputAmount(source, source.getPrimaryOutput()).divideAndRemainder(unit);
+                if (ratio[1].signum() != 0 || ratio[0].signum() <= 0) return false;
+                for (int i = 0; i < first.getInputs().length; i++) {
+                    if (!(first.getInputs()[i] instanceof PatternCompiler.DetachedInput a)
+                            || !(source.getInputs()[i] instanceof PatternCompiler.DetachedInput b)
+                            || a.exactKey() == null || !a.exactKey().equals(b.exactKey())
+                            || !a.exactKey().equals(a.craftedKey()) || !b.exactKey().equals(b.craftedKey())
+                            || a.emittable() || b.emittable() || a.mayReturnItems() || b.mayReturnItems()) return false;
+                    var aa = a.getPossibleInputs(); var bb = b.getPossibleInputs();
+                    if (aa.length == 0 || bb.length == 0 || !aa[0].what().equals(a.exactKey())
+                            || !bb[0].what().equals(b.exactKey()) || aa[0].amount() != bb[0].amount()
+                            || !a.isCandidatePrepared(a.exactKey()) || !b.isCandidatePrepared(b.exactKey())
+                            || a.getRemainingKey(a.exactKey()) != null || b.getRemainingKey(b.exactKey()) != null) return false;
+                    for (var t : aa) if (!t.equals(aa[0])) return false;
+                    for (var t : bb) if (!t.equals(bb[0])) return false;
+                    if (!PatternCompiler.inputMultiplier(b).equals(PatternCompiler.inputMultiplier(a).multiply(ratio[0]))) return false;
+                }
+            }
+            return true;
         }
     }
 

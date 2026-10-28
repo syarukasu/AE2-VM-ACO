@@ -26,8 +26,30 @@ final class NativeVmTiming {
     private final java.util.Map<String, Long> patternTypes;
     private long otherPatternTypes;
     private final java.util.Map<String, Long> remainderKeys;
+    private final java.util.Map<String, Long> returningKeys;
+    private long otherReturningCalls;
     private final long[] cacheHits, cacheMisses;
     private long patternCount;
+    private long planReused, planReuseVerified;
+    private long toolRules, toolRuleAnswers;
+    private long stockGuardAvailable, stockGuardReused;
+    private String stockGuardRejection;
+    synchronized void stockGuardRejected(com.ae2vm.addon.vm.VmStockGuard.Rejection rejection) {
+        stockGuardRejection = rejection.kind() + ":unavailable";
+        NativeVmProfiler.observe(() -> stockGuardRejection = rejection.kind() + ":" + rejection.key().getId());
+    }
+    synchronized void stockGuardAvailable(boolean available) { stockGuardAvailable = available ? 1 : 0; }
+    synchronized void stockGuardReused() { stockGuardReused = 1; }
+    synchronized void toolRuleCaptured() { toolRules++; }
+    synchronized void toolRuleAnswer() { toolRuleAnswers++; }
+    private long planReplayPrepared, planReplayIneligible, planReplayMetadataChanged, planReplayStockChanged, planReplayObservations;
+    synchronized void planReused() { planReused = 1; }
+    synchronized void planReuseVerified() { planReuseVerified = 1; }
+    synchronized void planReplayPrepared() { planReplayPrepared = 1; }
+    synchronized void planReplayIneligible() { planReplayIneligible = 1; }
+    synchronized void planReplayMetadataChanged() { planReplayMetadataChanged = 1; }
+    synchronized void planReplayStockChanged() { planReplayStockChanged = 1; }
+    synchronized void planReplayObservations(long count) { planReplayObservations = count; }
     private long initQueue = -1, workerQueue = -1, workerSubmitted;
     private long initializationSubmitted;
     private boolean initializationQueued;
@@ -45,6 +67,13 @@ final class NativeVmTiming {
     private long remainderCalls, remainderNull, otherRemainderCalls;
     private long queued, server, blocked, handoffs, vmActive;
     private long copies, branchTrials, branchEntries, aggregatedBlocks;
+    private long liveCopies, liveTrials, liveEntries, liveBlocks;
+    private boolean progressMeasured;
+    private String planningPath = "not-started";
+    private long routeReuses, retainedRoutes, routeReuseVerified;
+
+    synchronized void routes(long reused, long retained) { routeReuses += reused; retainedRoutes = retained; }
+    synchronized void routeReuseVerified() { routeReuseVerified++; }
     private boolean ae2Scheduled;
     private boolean graphScheduled;
     private long cpuStarted = -1;
@@ -74,6 +103,7 @@ final class NativeVmTiming {
         created = now();
         patternTypes = detailed ? new java.util.LinkedHashMap<>() : null;
         remainderKeys = detailed ? new java.util.LinkedHashMap<>() : null;
+        returningKeys = detailed ? new java.util.LinkedHashMap<>() : null;
         cacheHits = detailed ? new long[Cache.values().length] : null;
         cacheMisses = detailed ? new long[Cache.values().length] : null;
     }
@@ -191,6 +221,12 @@ final class NativeVmTiming {
         remainderCalls++;
         if (noReturn) remainderNull++;
         if (!detailed) return;
+        if (!noReturn) {
+            String returnedLabel = itemId.substring(0, Math.min(120, itemId.length()));
+            if (returningKeys.containsKey(returnedLabel) || returningKeys.size() < 32)
+                returningKeys.merge(returnedLabel, 1L, Long::sum);
+            else otherReturningCalls++;
+        }
         String label = inputClass + "/" + itemId;
         label = label.substring(0, Math.min(120, label.length()));
         if (remainderKeys.containsKey(label) || remainderKeys.size() < 12)
@@ -205,6 +241,17 @@ final class NativeVmTiming {
         executionMeasured = true;
         this.copies += copies; this.branchTrials += branchTrials; this.branchEntries += branchEntries;
         this.aggregatedBlocks += aggregatedBlocks;
+        liveCopies = liveTrials = liveEntries = liveBlocks = 0;
+        progressMeasured = false;
+    }
+    synchronized void executionProgress(long copies, long trials, long entries, long blocks) {
+        // #236: absolute current-pass samples; final execution() adds the pass once only.
+        liveCopies = copies; liveTrials = trials; liveEntries = entries; liveBlocks = blocks;
+        progressMeasured = true;
+    }
+    synchronized void planningPath(String path) {
+        planningPath = path.replace('\n', '_').replace('\r', '_').replace(' ', '_');
+        if (planningPath.length() > 240) planningPath = planningPath.substring(0, 240);
     }
     synchronized void vmWork(long instructions, long work) {
         this.instructions = instructions;
@@ -264,10 +311,26 @@ final class NativeVmTiming {
         counters.put("work", work);
         counters.put("nodes", -1L); // No node counter exists in the VM; instructions are not nodes.
         counters.put("patterns", patternCount);
-        counters.put("stateCopies", executionMeasured ? copies : -1L);
-        counters.put("branchTrials", executionMeasured ? branchTrials : -1L);
-        counters.put("branchEntries", executionMeasured ? branchEntries : -1L);
-        counters.put("aggregatedBlocks", executionMeasured ? aggregatedBlocks : -1L);
+        counters.put("planReused", planReused);
+        counters.put("routeReuses", routeReuses);
+        counters.put("retainedRoutes", retainedRoutes);
+        counters.put("routeReuseVerified", routeReuseVerified);
+        counters.put("toolRules", toolRules);
+        counters.put("toolRuleAnswers", toolRuleAnswers);
+        counters.put("stockGuardAvailable", stockGuardAvailable);
+        counters.put("stockGuardReused", stockGuardReused);
+        if (stockGuardRejection != null) counters.put("stockGuardRejected:" + stockGuardRejection, 1L);
+        counters.put("planReuseVerified", planReuseVerified);
+        counters.put("planReplayPrepared", planReplayPrepared);
+        counters.put("planReplayIneligible", planReplayIneligible);
+        counters.put("planReplayMetadataChanged", planReplayMetadataChanged);
+        counters.put("planReplayStockChanged", planReplayStockChanged);
+        counters.put("planReplayObservations", planReplayObservations);
+        counters.put("plannerPath:" + planningPath, 1L);
+        counters.put("stateCopies", executionMeasured || progressMeasured ? copies + liveCopies : -1L);
+        counters.put("branchTrials", executionMeasured || progressMeasured ? branchTrials + liveTrials : -1L);
+        counters.put("branchEntries", executionMeasured || progressMeasured ? branchEntries + liveEntries : -1L);
+        counters.put("aggregatedBlocks", executionMeasured || progressMeasured ? aggregatedBlocks + liveBlocks : -1L);
         counters.put("remainderCalls", remainderCalls);
         counters.put("remainderNull", remainderNull);
         counters.put("compileHits", compileHits);
@@ -284,6 +347,8 @@ final class NativeVmTiming {
             counters.put("otherPatternTypes", otherPatternTypes);
             remainderKeys.forEach((key, value) -> counters.put("remainder:" + key, value));
             counters.put("otherRemainderCalls", otherRemainderCalls);
+            returningKeys.forEach((key, value) -> counters.put("returning:" + key, value));
+            counters.put("otherReturningCalls", otherReturningCalls);
         }
         nanos.replaceAll((key, value) -> value < 0 ? -1L : value);
         counters.replaceAll((key, value) -> value < 0 ? -1L : value);
@@ -310,6 +375,14 @@ final class NativeVmTiming {
         var remainders = new java.util.StringJoiner(",", "{", "}");
         if (detailed) remainderKeys.forEach((name, count) -> remainders.add(name + ":" + count));
         return "stockMs=" + ms(phases[Phase.STOCK.ordinal()])
+                + " plannerPath=" + planningPath
+                + " planReused=" + planReused + " planReuseVerified=" + planReuseVerified
+                + " toolRules=" + toolRules + " toolRuleAnswers=" + toolRuleAnswers
+                + " stockGuardAvailable=" + stockGuardAvailable + " stockGuardReused=" + stockGuardReused
+                + " stockGuardRejection=" + (stockGuardRejection == null ? "none" : stockGuardRejection)
+                + " planReplayPrepared=" + planReplayPrepared + " planReplayIneligible=" + planReplayIneligible
+                + " planReplayMetadataChanged=" + planReplayMetadataChanged + " planReplayStockChanged=" + planReplayStockChanged
+                + " planReplayObservations=" + planReplayObservations
                 + " prepareMs=" + ms(phases[Phase.PREPARE.ordinal()])
                 + " vmMs=" + ms(phases[Phase.VM.ordinal()])
                 + " vmActiveMs=" + (ae2Scheduled && !graphScheduled ? -1 : ms(vmActive))
@@ -328,7 +401,10 @@ final class NativeVmTiming {
                 + " patternTypes=" + types + " otherPatternTypes=" + otherPatternTypes
                 + " remainderCalls=" + remainderCalls + " remainderNull=" + remainderNull
                 + " remainderKeys=" + remainders + " otherRemainderCalls=" + otherRemainderCalls
-                + " stateCopies=" + copies + " branchTrials=" + branchTrials
-                + " branchEntries=" + branchEntries + " aggregatedBlocks=" + aggregatedBlocks;
+                + " routeReuses=" + routeReuses + " retainedRoutes=" + retainedRoutes + " routeReuseVerified=" + routeReuseVerified
+                + " stateCopies=" + (executionMeasured || progressMeasured ? copies + liveCopies : -1)
+                + " branchTrials=" + (executionMeasured || progressMeasured ? branchTrials + liveTrials : -1)
+                + " branchEntries=" + (executionMeasured || progressMeasured ? branchEntries + liveEntries : -1)
+                + " aggregatedBlocks=" + (executionMeasured || progressMeasured ? aggregatedBlocks + liveBlocks : -1);
     }
 }

@@ -20,12 +20,14 @@ final class NativeCraftingRule {
     private final List<Set<Item>> ingredients;
     private final Item[] encoded;
     private final int width, height, slot;
+    private final boolean mirror, matchSize;
     private final AEKey primary;
     private final Map<Item, AEKey> remainders;
+    private final Map<Item, AEKey[]> returnFamilies;
     private final Map<Item, Boolean> matches = new IdentityHashMap<>();
 
     private NativeCraftingRule(List<Set<Item>> ingredients, Item[] encoded, int width, int height,
-            int slot, AEKey primary, Map<Item, AEKey> remainders) {
+            int slot, AEKey primary, Map<Item, AEKey> remainders, boolean mirror, boolean matchSize) {
         this.ingredients = ingredients;
         this.encoded = encoded;
         this.width = width;
@@ -33,13 +35,28 @@ final class NativeCraftingRule {
         this.slot = slot;
         this.primary = primary;
         this.remainders = remainders;
+        this.returnFamilies = new IdentityHashMap<>();
+        for (var ingredient : ingredients) for (var item : ingredient) {
+            if (remainders.containsKey(item)) {
+                var returned = remainders.get(item);
+                returnFamilies.put(item, returned == null ? new AEKey[0] : new AEKey[]{returned});
+            } else if (!returnFamilies.containsKey(item)) {
+                var bound = NativeToolRule.returnFamilyUpperBound(item);
+                if (bound != null) returnFamilies.put(item, bound);
+            }
+        }
+        this.mirror = mirror;
+        this.matchSize = matchSize;
     }
 
     static NativeCraftingRule[] capture(AECraftingPattern pattern, Level level) {
         if (!pattern.canSubstitute() || RECIPE == null) return null;
         try {
             var recipe = (CraftingRecipe) RECIPE.get(pattern);
-            if (recipe.getClass() != ShapedRecipe.class && recipe.getClass() != ShapelessRecipe.class) return null;
+            boolean strict = recipe.getClass().getName().equals("com.gregtechceu.gtceu.api.recipe.StrictShapedRecipe")
+                    && NativeToolRule.auditedVersion();
+            if (recipe.getClass() != ShapedRecipe.class && recipe.getClass() != ShapelessRecipe.class && !strict) return null;
+            boolean matchSize = strict && (boolean) recipe.getClass().getMethod("isMatchSize").invoke(recipe);
             var result = recipe.getResultItem(level.registryAccess());
             var output = pattern.getPrimaryOutput();
             if (!Objects.equals(AEItemKey.of(result), output.what()) || result.getCount() != output.amount()) return null;
@@ -75,19 +92,27 @@ final class NativeCraftingRule {
                 for (int i = 0; i < sparse.length; i++) {
                     if (sparse[i] != null && sparse[i].what().equals(primary)) {
                         rules[index] = new NativeCraftingRule(List.copyOf(ingredients), encoded, width, height,
-                                i, primary, remainders);
+                                i, primary, remainders, !strict, matchSize);
                         break;
                     }
                 }
             }
             return rules;
-        } catch (IllegalAccessException unavailable) {
+        } catch (ReflectiveOperationException unavailable) {
             return null;
         }
     }
 
     boolean covers(AEKey key) {
         return !(key instanceof AEItemKey item) || remainders.containsKey(item.getItem());
+    }
+
+    AEKey[] returnFamilyUpperBound(AEKey key) {
+        // #236: capture the complete native family contract, never an observed opaque return.
+        if (!(key instanceof AEItemKey item) || !(primary.equals(key)
+                || matches.computeIfAbsent(item.getItem(), this::matches))) return new AEKey[0];
+        var bound = returnFamilies.get(item.getItem());
+        return bound == null ? null : bound.clone();
     }
 
     Decision evaluate(AEKey key) {
@@ -100,8 +125,9 @@ final class NativeCraftingRule {
 
     private boolean matches(Item replacement) {
         if (width == 0) return shapeless(0, 0, replacement, new boolean[1 << ingredients.size()]);
+        if (matchSize && (width != 3 || height != 3)) return false;
         for (int y = 0; y <= 3 - height; y++) for (int x = 0; x <= 3 - width; x++)
-            if (shaped(x, y, false, replacement) || shaped(x, y, true, replacement)) return true;
+            if (shaped(x, y, false, replacement) || mirror && shaped(x, y, true, replacement)) return true;
         return false;
     }
 
@@ -137,5 +163,11 @@ final class NativeCraftingRule {
         } catch (ReflectiveOperationException | SecurityException unavailable) {
             return null;
         }
+    }
+
+    static String recipeKind(appeng.api.crafting.IPatternDetails pattern) {
+        if (!(pattern instanceof AECraftingPattern) || RECIPE == null) return pattern.getClass().getSimpleName();
+        try { return RECIPE.get(pattern).getClass().getSimpleName(); }
+        catch (IllegalAccessException unavailable) { return "unknown"; }
     }
 }

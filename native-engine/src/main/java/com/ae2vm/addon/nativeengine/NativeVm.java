@@ -51,6 +51,7 @@ public final class NativeVm {
     }
 
     public static void cancelServer(MinecraftServer server) {
+        NativeVmPlanningContext.clearReusablePlans();
         ACTIVE.forEach((future, owner) -> { if (owner == server) future.cancel(true); });
     }
 
